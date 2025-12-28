@@ -7,6 +7,7 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 
 export class InfrastructureStack extends cdk.Stack {
   public readonly table: dynamodb.TableV2;
@@ -248,5 +249,139 @@ export class InfrastructureStack extends cdk.Stack {
       description: 'API Gateway endpoint URL for notification submission',
       exportName: `${this.stackName}-ApiEndpoint`,
     });
+
+    // Additional monitoring and integration enhancements
+
+    // Add structured logging environment variables to Lambda
+    this.function.addEnvironment('LOG_LEVEL', 'INFO');
+    this.function.addEnvironment('SERVICE_NAME', 'notification-api');
+
+    // Configure API Gateway access logging
+    const accessLogGroup = new logs.LogGroup(this, 'ApiGatewayAccessLogs', {
+      logGroupName: `/aws/apigateway/${this.stackName}`,
+      retention: logs.RetentionDays.ONE_MONTH,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    // Create additional CloudWatch alarms
+    // Lambda errors alarm
+    const lambdaErrorsAlarm = new cloudwatch.Alarm(this, 'LambdaErrorsAlarm', {
+      alarmName: `${this.stackName}-Lambda-Errors`,
+      alarmDescription: 'Lambda function is experiencing errors',
+      metric: this.function.metricErrors(),
+      threshold: 5,
+      evaluationPeriods: 2,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+    });
+
+    // API Gateway errors alarm
+    const apiErrorsAlarm = new cloudwatch.Alarm(this, 'ApiGatewayErrorsAlarm', {
+      alarmName: `${this.stackName}-API-Gateway-Errors`,
+      alarmDescription: 'API Gateway is experiencing 5xx errors',
+      metric: this.api.metricServerError(),
+      threshold: 10,
+      evaluationPeriods: 2,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+    });
+
+    // DynamoDB throttles alarm
+    const dynamoThrottlesAlarm = new cloudwatch.Alarm(this, 'DynamoDBThrottlesAlarm', {
+      alarmName: `${this.stackName}-DynamoDB-Throttles`,
+      alarmDescription: 'DynamoDB table is being throttled',
+      metric: this.table.metricThrottledRequestsForOperations({
+        operations: [dynamodb.Operation.PUT_ITEM, dynamodb.Operation.GET_ITEM, dynamodb.Operation.UPDATE_ITEM],
+      }),
+      threshold: 5,
+      evaluationPeriods: 2,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+    });
+
+    // Create CloudWatch dashboard
+    const dashboard = new cloudwatch.Dashboard(this, 'NotificationSystemDashboard', {
+      dashboardName: 'NotificationSystem-Dashboard',
+    });
+
+    // Add widgets to dashboard
+    dashboard.addWidgets(
+      // API Gateway metrics
+      new cloudwatch.GraphWidget({
+        title: 'API Gateway Request Count',
+        left: [this.api.metricCount()],
+        width: 12,
+      }),
+      new cloudwatch.GraphWidget({
+        title: 'API Gateway Latency',
+        left: [this.api.metricLatency()],
+        width: 12,
+      }),
+      // Lambda metrics
+      new cloudwatch.GraphWidget({
+        title: 'Lambda Invocations',
+        left: [this.function.metricInvocations()],
+        width: 12,
+      }),
+      new cloudwatch.GraphWidget({
+        title: 'Lambda Duration',
+        left: [this.function.metricDuration()],
+        width: 12,
+      }),
+      // DynamoDB metrics
+      new cloudwatch.GraphWidget({
+        title: 'DynamoDB Throttled Requests',
+        left: [this.table.metricThrottledRequests()],
+        width: 12,
+      }),
+      new cloudwatch.GraphWidget({
+        title: 'DynamoDB Consumed Read Capacity',
+        left: [this.table.metricConsumedReadCapacityUnits()],
+        width: 12,
+      }),
+      // SQS metrics
+      new cloudwatch.GraphWidget({
+        title: 'SQS Queue Depth',
+        left: [this.queue.metricApproximateNumberOfMessagesVisible()],
+        width: 12,
+      }),
+      new cloudwatch.GraphWidget({
+        title: 'SQS Messages Sent',
+        left: [this.queue.metricNumberOfMessagesSent()],
+        width: 12,
+      }),
+      // Error metrics
+      new cloudwatch.GraphWidget({
+        title: 'Error Rates',
+        left: [
+          this.function.metricErrors(),
+          this.api.metricServerError(),
+        ],
+        width: 12,
+      }),
+      new cloudwatch.GraphWidget({
+        title: 'SQS Messages Deleted',
+        left: [this.queue.metricNumberOfMessagesDeleted()],
+        width: 12,
+      })
+    );
+
+    // Add resource tags for cost allocation
+    cdk.Tags.of(this).add('Environment', 'development');
+    cdk.Tags.of(this).add('Project', 'notification-system');
+    cdk.Tags.of(this).add('Owner', 'platform-team');
+    cdk.Tags.of(this).add('CostCenter', 'engineering');
+
+    // Additional stack outputs
+    new cdk.CfnOutput(this, 'DashboardUrl', {
+      value: `https://${cdk.Aws.REGION}.console.aws.amazon.com/cloudwatch/home?region=${cdk.Aws.REGION}#dashboards:name=${dashboard.dashboardName}`,
+      description: 'CloudWatch dashboard URL for monitoring',
+      exportName: `${this.stackName}-DashboardUrl`,
+    });
+
+    new cdk.CfnOutput(this, 'ApiKeyId', {
+      value: apiKey.keyId,
+      description: 'API Gateway API key ID for authentication',
+      exportName: `${this.stackName}-ApiKeyId`,
+    });
+
+    console.log('Infrastructure stack integration complete with monitoring and logging configured');
   }
 }
