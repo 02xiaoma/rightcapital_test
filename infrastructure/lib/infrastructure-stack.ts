@@ -19,6 +19,9 @@ export class InfrastructureStack extends cdk.Stack {
   public readonly function: lambda.Function;
   public readonly functionName: string;
   public readonly functionArn: string;
+  public readonly workerFunction: lambda.Function;
+  public readonly workerFunctionName: string;
+  public readonly workerFunctionArn: string;
   public readonly api: apigateway.RestApi;
   public readonly apiEndpoint: string;
 
@@ -559,7 +562,111 @@ export class InfrastructureStack extends cdk.Stack {
 
     console.log('Lambda function created:', this.function.functionName);
 
-    // Add IAM policies for DynamoDB and SQS access
+    // Create worker Lambda function for message processing
+    this.workerFunction = new lambda.Function(this, 'WorkerFunction', {
+      runtime: lambda.Runtime.NODEJS_18_X,
+      code: lambda.Code.fromInline(`
+        // Worker Lambda handler for SQS message processing
+        exports.handler = async (event) => {
+          console.log('Worker processing SQS messages:', {
+            messageCount: event.Records?.length || 0,
+            logLevel: process.env.LOG_LEVEL,
+            serviceName: process.env.SERVICE_NAME
+          });
+
+          // Process each SQS message
+          const results = [];
+          for (const record of event.Records || []) {
+            try {
+              console.log('Processing message:', {
+                messageId: record.messageId,
+                receiptHandle: record.receiptHandle?.substring(0, 20) + '...',
+                correlationId: record.messageAttributes?.correlationId?.stringValue
+              });
+
+              // Parse message body
+              const messageBody = JSON.parse(record.body);
+              console.log('Message payload:', {
+                messageId: messageBody.messageId,
+                targetUrl: messageBody.targetUrl,
+                method: messageBody.method
+              });
+
+              // TODO: Implement HTTP request execution logic
+              // This will be implemented in the next task
+
+              results.push({
+                messageId: record.messageId,
+                status: 'processed',
+                result: 'success'
+              });
+
+            } catch (error) {
+              console.error('Error processing message:', {
+                messageId: record.messageId,
+                error: error.message,
+                correlationId: record.messageAttributes?.correlationId?.stringValue
+              });
+
+              results.push({
+                messageId: record.messageId,
+                status: 'failed',
+                error: error.message
+              });
+            }
+          }
+
+          console.log('Worker processing complete:', {
+            totalMessages: event.Records?.length || 0,
+            successful: results.filter(r => r.status === 'processed').length,
+            failed: results.filter(r => r.status === 'failed').length
+          });
+
+          return {
+            statusCode: 200,
+            processedMessages: results.length,
+            results
+          };
+        };
+      `),
+      handler: 'index.handler',
+      memorySize: 256, // Optimized for HTTP processing
+      timeout: cdk.Duration.seconds(25), // Allow time for HTTP request completion
+      logRetention: logs.RetentionDays.ONE_MONTH,
+    });
+
+    console.log('Worker Lambda function created:', this.workerFunction.functionName);
+
+    // Add IAM policies for worker function
+    // DynamoDB policy for worker
+    const workerDynamoDBPolicy = new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'dynamodb:GetItem',
+        'dynamodb:PutItem',
+        'dynamodb:UpdateItem',
+        'dynamodb:Query',
+        'dynamodb:Scan',
+      ],
+      resources: [this.table.tableArn],
+    });
+
+    // SQS policy for worker
+    const workerSQSPolicy = new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'sqs:ReceiveMessage',
+        'sqs:DeleteMessage',
+        'sqs:GetQueueAttributes',
+      ],
+      resources: [this.queue.queueArn],
+    });
+
+    // Attach policies to worker Lambda execution role
+    this.workerFunction.addToRolePolicy(workerDynamoDBPolicy);
+    this.workerFunction.addToRolePolicy(workerSQSPolicy);
+
+    // Add IAM policies for API handler function
     // DynamoDB policy
     const dynamoDBPolicy = new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
@@ -587,7 +694,7 @@ export class InfrastructureStack extends cdk.Stack {
       resources: [this.queue.queueArn],
     });
 
-    // Attach policies to Lambda execution role
+    // Attach policies to API Lambda execution role
     this.function.addToRolePolicy(dynamoDBPolicy);
     this.function.addToRolePolicy(sqsPolicy);
 
@@ -637,6 +744,8 @@ export class InfrastructureStack extends cdk.Stack {
     // Export properties
     this.functionName = this.function.functionName;
     this.functionArn = this.function.functionArn;
+    this.workerFunctionName = this.workerFunction.functionName;
+    this.workerFunctionArn = this.workerFunction.functionArn;
     this.apiEndpoint = this.api.url;
 
     // Export table properties for cross-stack references
@@ -681,6 +790,18 @@ export class InfrastructureStack extends cdk.Stack {
       exportName: `${this.stackName}-FunctionArn`,
     });
 
+    new cdk.CfnOutput(this, 'WorkerFunctionName', {
+      value: this.workerFunction.functionName,
+      description: 'Worker Lambda function name for message processing',
+      exportName: `${this.stackName}-WorkerFunctionName`,
+    });
+
+    new cdk.CfnOutput(this, 'WorkerFunctionArn', {
+      value: this.workerFunction.functionArn,
+      description: 'Worker Lambda function ARN for message processing',
+      exportName: `${this.stackName}-WorkerFunctionArn`,
+    });
+
     new cdk.CfnOutput(this, 'ApiEndpoint', {
       value: this.api.url,
       description: 'API Gateway endpoint URL for notification submission',
@@ -695,6 +816,11 @@ export class InfrastructureStack extends cdk.Stack {
     this.function.addEnvironment('DYNAMODB_TABLE_NAME', this.table.tableName);
     this.function.addEnvironment('MESSAGE_RETENTION_DAYS', '30');
     this.function.addEnvironment('SQS_QUEUE_URL', this.queue.queueUrl);
+
+    // Add environment variables to worker Lambda
+    this.workerFunction.addEnvironment('LOG_LEVEL', 'INFO');
+    this.workerFunction.addEnvironment('SERVICE_NAME', 'notification-worker');
+    this.workerFunction.addEnvironment('DYNAMODB_TABLE_NAME', this.table.tableName);
 
     // Configure API Gateway access logging
     const accessLogGroup = new logs.LogGroup(this, 'ApiGatewayAccessLogs', {
