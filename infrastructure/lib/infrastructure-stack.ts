@@ -46,20 +46,7 @@ export class InfrastructureStack extends cdk.Stack {
 
     console.log('DynamoDB table created:', this.table.tableName);
 
-    // Create SQS queue for message buffering with optimized settings for high-throughput
-    this.queue = new sqs.Queue(this, 'MessageQueue', {
-      visibilityTimeout: cdk.Duration.seconds(30), // Match Lambda timeout to prevent duplicate processing
-      retentionPeriod: cdk.Duration.days(4), // 4 days retention for adequate processing buffer
-      deliveryDelay: cdk.Duration.seconds(0), // Immediate delivery for high-throughput scenarios
-      receiveMessageWaitTime: cdk.Duration.seconds(20), // Long polling for efficiency (max 20 seconds)
-      maxMessageSizeBytes: 262144, // Maximum message size (256 KB) for comprehensive payloads
-      encryption: sqs.QueueEncryption.SQS_MANAGED, // Server-side encryption for security
-      removalPolicy: cdk.RemovalPolicy.DESTROY, // For development
-    });
-
-    console.log('SQS queue created:', this.queue.queueName);
-
-    // Create Dead Letter Queue for messages that exhaust all retries
+    // Create Dead Letter Queue first (needed for redrive policy reference)
     this.dlq = new sqs.Queue(this, 'DeadLetterQueue', {
       visibilityTimeout: cdk.Duration.seconds(30), // Same visibility timeout as main queue
       retentionPeriod: cdk.Duration.days(14), // Extended retention for dead letters (14 days)
@@ -71,6 +58,24 @@ export class InfrastructureStack extends cdk.Stack {
     });
 
     console.log('Dead Letter Queue created:', this.dlq.queueName);
+
+    // Create SQS queue for message buffering with optimized settings for high-throughput
+    this.queue = new sqs.Queue(this, 'MessageQueue', {
+      visibilityTimeout: cdk.Duration.seconds(30), // Match Lambda timeout to prevent duplicate processing
+      retentionPeriod: cdk.Duration.days(4), // 4 days retention for adequate processing buffer
+      deliveryDelay: cdk.Duration.seconds(0), // Immediate delivery for high-throughput scenarios
+      receiveMessageWaitTime: cdk.Duration.seconds(20), // Long polling for efficiency (max 20 seconds)
+      maxMessageSizeBytes: 262144, // Maximum message size (256 KB) for comprehensive payloads
+      encryption: sqs.QueueEncryption.SQS_MANAGED, // Server-side encryption for security
+      // Configure redrive policy to move failed messages to DLQ after maxReceiveCount attempts
+      deadLetterQueue: {
+        queue: this.dlq,
+        maxReceiveCount: 3, // Move to DLQ after 3 failed processing attempts (matches retry limit)
+      },
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // For development
+    });
+
+    console.log('SQS queue created:', this.queue.queueName);
 
     // Add CloudWatch alarm for SQS queue depth
     const queueDepthAlarm = new cloudwatch.Alarm(this, 'QueueDepthAlarm', {
