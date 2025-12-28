@@ -367,12 +367,73 @@ export class InfrastructureStack extends cdk.Stack {
                 MessageAttributes: messageAttributes
               };
 
-              await sqs.sendMessage(sendMessageParams).promise();
+              try {
+                await sqs.sendMessage(sendMessageParams).promise();
 
-              console.log('Message successfully sent to SQS:', {
-                messageId: requestBody.messageId,
-                messageId: sendMessageParams.MessageAttributes.messageId.StringValue
-              });
+                console.log('Message successfully sent to SQS:', {
+                  messageId: requestBody.messageId,
+                  messageId: sendMessageParams.MessageAttributes.messageId.StringValue
+                });
+              } catch (sqsError) {
+                // SQS send failed - rollback status and return error
+                console.error('SQS send operation failed:', {
+                  error: sqsError.message,
+                  errorCode: sqsError.code,
+                  messageId: requestBody.messageId,
+                  senderId: requestBody.senderId,
+                  queueUrl: process.env.SQS_QUEUE_URL,
+                  correlationId: event.requestContext?.requestId || 'unknown'
+                });
+
+                // Attempt to rollback status from QUEUED to PENDING
+                try {
+                  console.log('Attempting status rollback from QUEUED to PENDING:', {
+                    messageId: requestBody.messageId,
+                    currentStatus: 'QUEUED',
+                    targetStatus: 'PENDING'
+                  });
+
+                  const rollbackParams = {
+                    TableName: process.env.DYNAMODB_TABLE_NAME || 'NotificationMessages',
+                    Key: {
+                      pk: messageMetadata.pk,
+                      sk: messageMetadata.sk
+                    },
+                    UpdateExpression: 'SET #status = :newStatus',
+                    ConditionExpression: 'attribute_exists(pk) AND #status = :currentStatus',
+                    ExpressionAttributeNames: {
+                      '#status': 'status'
+                    },
+                    ExpressionAttributeValues: {
+                      ':newStatus': 'PENDING',
+                      ':currentStatus': 'QUEUED'
+                    },
+                    ReturnValues: 'ALL_NEW'
+                  };
+
+                  await dynamodb.update(rollbackParams).promise();
+
+                  console.log('Status rollback successful:', {
+                    messageId: requestBody.messageId,
+                    previousStatus: 'QUEUED',
+                    newStatus: 'PENDING'
+                  });
+
+                } catch (rollbackError) {
+                  // Rollback failed - log but still return error
+                  console.error('Status rollback failed:', {
+                    error: rollbackError.message,
+                    messageId: requestBody.messageId,
+                    attemptedRollback: 'QUEUED -> PENDING'
+                  });
+
+                  // Continue with error response - data consistency may be compromised
+                  // but we still need to inform the client
+                }
+
+                // Return error response for SQS failure
+                return createErrorResponse('SYSTEM_ERROR', 'An internal server error occurred');
+              }
 
               // Update message status to QUEUED after successful SQS send
               console.log('Updating message status to QUEUED:', {
