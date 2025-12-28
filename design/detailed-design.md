@@ -48,17 +48,18 @@ The system follows an event-driven architecture using serverless components for 
 graph TD
     A[Internal Business System] --> B[API Gateway]
     B --> C[Validation Lambda]
-    C --> D{DynamoDB Dedup Check}
-    D -->|New Message| E[SQS Standard Queue]
-    D -->|Duplicate| F[Return Success]
-    E --> G[Worker Lambda]
-    G --> H{Delivery Attempt}
-    H -->|Success| I[Update Status]
-    H -->|Failure| J{Retry Count < 3?}
-    J -->|Yes| K[Exponential Backoff]
-    K --> E
-    J -->|No| L[SQS Dead Letter Queue]
-    G --> M[Metrics (CloudWatch)]
+    C --> D{Is Duplicate?}
+    D -->|Yes| E[Return Success]
+    D -->|No| F[DynamoDB Store Metadata]
+    F --> G[SQS Standard Queue]
+    G --> H[Worker Lambda]
+    H --> I{Delivery Attempt}
+    I -->|Success| J[Update Status in DynamoDB]
+    I -->|Failure| K{Retry Count < 3?}
+    K -->|Yes| L[Exponential Backoff]
+    L --> G
+    K -->|No| M[SQS Dead Letter Queue]
+    H --> N[Metrics to CloudWatch]
 ```
 
 Key components:
