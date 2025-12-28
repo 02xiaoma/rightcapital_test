@@ -1033,17 +1033,25 @@ export class InfrastructureStack extends cdk.Stack {
                               correlationId,
                               attempts: currentAttempts,
                               maxRetries: 3,
-                              action: 'mark_as_permanently_failed'
+                              action: 'mark_as_permanently_failed',
+                              errorDetails: outcome.errorDetails,
+                              lastErrorCategory: outcome.category,
+                              httpStatus: outcome.statusCode,
+                              responseTime: outcome.responseTime,
+                              targetUrl: messageBody.targetUrl,
+                              senderId: messageBody.senderId,
+                              messageAge: Date.now() - new Date(messageBody.timestamp).getTime(),
+                              dlqBound: true
                             });
 
-                            // Update status to indicate max retries exceeded
+                            // Update status to indicate max retries exceeded with comprehensive failure details
                             const maxRetryUpdateParams = {
                               TableName: process.env.DYNAMODB_TABLE_NAME || 'NotificationMessages',
                               Key: {
                                 pk: messageBody.messageId + '#' + messageBody.senderId,
                                 sk: messageBody.timestamp + '#' + messageBody.targetUrl
                               },
-                              UpdateExpression: 'SET #status = :maxRetryStatus, maxRetriesExceeded = :maxRetryExceeded, maxRetriesExceededAt = :maxRetryExceededAt, lastUpdatedAt = :lastUpdatedAt',
+                              UpdateExpression: 'SET #status = :maxRetryStatus, maxRetriesExceeded = :maxRetryExceeded, maxRetriesExceededAt = :maxRetryExceededAt, lastUpdatedAt = :lastUpdatedAt, dlqBound = :dlqBound, finalFailureReason = :finalFailureReason, finalFailureDetails = :finalFailureDetails',
                               ConditionExpression: 'attribute_exists(pk) AND #status = :currentStatus',
                               ExpressionAttributeNames: {
                                 '#status': 'status'
@@ -1053,6 +1061,23 @@ export class InfrastructureStack extends cdk.Stack {
                                 ':maxRetryExceeded': true,
                                 ':maxRetryExceededAt': new Date().toISOString(),
                                 ':lastUpdatedAt': new Date().toISOString(),
+                                ':dlqBound': true,
+                                ':finalFailureReason': 'Max retries exceeded after ' + currentAttempts + ' attempts. Last error: ' + outcome.category,
+                                ':finalFailureDetails': {
+                                  totalAttempts: currentAttempts,
+                                  maxRetries: 3,
+                                  lastErrorCategory: outcome.category,
+                                  lastHttpStatus: outcome.statusCode,
+                                  lastResponseTime: outcome.responseTime,
+                                  lastErrorDetails: outcome.errorDetails,
+                                  targetUrl: messageBody.targetUrl,
+                                  senderId: messageBody.senderId,
+                                  messageTimestamp: messageBody.timestamp,
+                                  messageAgeMs: Date.now() - new Date(messageBody.timestamp).getTime(),
+                                  exhaustedAt: new Date().toISOString(),
+                                  willMoveToDLQ: true,
+                                  dlqArn: 'configured-via-redrive-policy'
+                                },
                                 ':currentStatus': 'FAILED'
                               },
                               ReturnValues: 'ALL_NEW'
@@ -1064,7 +1089,10 @@ export class InfrastructureStack extends cdk.Stack {
                               messageId: messageBody.messageId,
                               correlationId,
                               finalStatus: 'MAX_RETRIES_EXCEEDED',
-                              totalAttempts: currentAttempts
+                              totalAttempts: currentAttempts,
+                              dlqBound: true,
+                              finalFailureReason: 'Max retries exceeded after ' + currentAttempts + ' attempts. Last error: ' + outcome.category,
+                              willBeMovedToDLQ: 'by redrive policy after visibility timeout expires'
                             });
 
                             results.push({
@@ -1079,6 +1107,8 @@ export class InfrastructureStack extends cdk.Stack {
                               finalStatus: 'MAX_RETRIES_EXCEEDED',
                               attempts: currentAttempts,
                               maxRetriesExceeded: true,
+                              dlqBound: true,
+                              finalFailureReason: 'Max retries exceeded after ' + currentAttempts + ' attempts',
                               outcome: outcome,
                               deliveryResult: deliveryResult
                             });
