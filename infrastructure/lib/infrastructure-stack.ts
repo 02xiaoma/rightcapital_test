@@ -855,48 +855,143 @@ export class InfrastructureStack extends cdk.Stack {
                     }
                   });
 
-                  if (outcome.success) {
-                    console.log('Message delivery successful:', {
+                  // Update DynamoDB with comprehensive delivery results
+                  try {
+                    console.log('Updating message status and delivery results:', {
                       messageId: messageBody.messageId,
                       correlationId,
-                      httpStatus: httpResponse.status,
-                      responseTime: requestDuration,
-                      category: outcome.category
+                      finalStatus: outcome.success ? 'SUCCESS' : 'FAILED',
+                      category: outcome.category,
+                      retryEligible: outcome.retryEligible
                     });
 
+                    // Prepare comprehensive delivery result data
+                    const deliveryResult = {
+                      success: outcome.success,
+                      retryEligible: outcome.retryEligible,
+                      category: outcome.category,
+                      statusCode: outcome.statusCode,
+                      statusText: outcome.statusText,
+                      responseTime: outcome.responseTime,
+                      errorDetails: outcome.errorDetails,
+                      timestamp: outcome.timestamp,
+                      correlationId: outcome.correlationId,
+                      httpResponseReceivedAt: new Date().toISOString()
+                    };
+
+                    // Determine retry count increment (only increment for failed attempts with retry eligibility)
+                    const retryIncrement = (!outcome.success && outcome.retryEligible) ? 1 : 0;
+
+                    // Update message record with comprehensive delivery results
+                    const deliveryUpdateParams = {
+                      TableName: process.env.DYNAMODB_TABLE_NAME || 'NotificationMessages',
+                      Key: {
+                        pk: messageBody.messageId + '#' + messageBody.senderId,
+                        sk: messageBody.timestamp + '#' + messageBody.targetUrl
+                      },
+                      UpdateExpression: 'SET #status = :finalStatus, deliveryResult = :deliveryResult, attempts = attempts + :retryIncrement, lastDeliveryAttempt = :timestamp, lastUpdatedAt = :timestamp, deliveredAt = :deliveredAt',
+                      ConditionExpression: 'attribute_exists(pk) AND #status = :currentStatus',
+                      ExpressionAttributeNames: {
+                        '#status': 'status'
+                      },
+                      ExpressionAttributeValues: {
+                        ':finalStatus': outcome.success ? 'SUCCESS' : 'FAILED',
+                        ':deliveryResult': deliveryResult,
+                        ':retryIncrement': retryIncrement,
+                        ':timestamp': new Date().toISOString(),
+                        ':deliveredAt': outcome.success ? new Date().toISOString() : null,
+                        ':currentStatus': 'PROCESSING'
+                      },
+                      ReturnValues: 'ALL_NEW'
+                    };
+
+                    const deliveryUpdateResult = await dynamodb.update(deliveryUpdateParams).promise();
+
+                    console.log('Delivery results updated successfully:', {
+                      messageId: messageBody.messageId,
+                      correlationId,
+                      finalStatus: deliveryUpdateResult.Attributes.status,
+                      attempts: deliveryUpdateResult.Attributes.attempts,
+                      deliveryResultSize: JSON.stringify(deliveryResult).length,
+                      retryIncrement
+                    });
+
+                    if (outcome.success) {
+                      console.log('Message delivery completed successfully:', {
+                        messageId: messageBody.messageId,
+                        correlationId,
+                        httpStatus: httpResponse.status,
+                        responseTime: requestDuration,
+                        finalStatus: 'SUCCESS',
+                        deliveredAt: deliveryUpdateResult.Attributes.deliveredAt
+                      });
+
+                      results.push({
+                        messageId: record.messageId,
+                        status: 'delivered',
+                        correlationId,
+                        processingStartedAt: updateResult.Attributes.processingStartedAt,
+                        httpStatus: httpResponse.status,
+                        httpStatusText: httpResponse.statusText,
+                        responseTime: requestDuration,
+                        deliveredAt: deliveryUpdateResult.Attributes.deliveredAt,
+                        finalStatus: 'SUCCESS',
+                        attempts: deliveryUpdateResult.Attributes.attempts,
+                        outcome: outcome,
+                        deliveryResult: deliveryResult
+                      });
+                    } else {
+                      console.error('Message delivery failed with comprehensive tracking:', {
+                        messageId: messageBody.messageId,
+                        correlationId,
+                        httpStatus: httpResponse.status,
+                        httpStatusText: httpResponse.statusText,
+                        responseTime: requestDuration,
+                        finalStatus: 'FAILED',
+                        category: outcome.category,
+                        retryEligible: outcome.retryEligible,
+                        attempts: deliveryUpdateResult.Attributes.attempts,
+                        errorDetails: outcome.errorDetails
+                      });
+
+                      results.push({
+                        messageId: record.messageId,
+                        status: 'failed',
+                        correlationId,
+                        error: outcome.category,
+                        httpStatus: httpResponse.status,
+                        httpStatusText: httpResponse.statusText,
+                        responseTime: requestDuration,
+                        retryEligible: outcome.retryEligible,
+                        finalStatus: 'FAILED',
+                        attempts: deliveryUpdateResult.Attributes.attempts,
+                        outcome: outcome,
+                        deliveryResult: deliveryResult
+                      });
+                    }
+
+                  } catch (deliveryUpdateError) {
+                    console.error('Failed to update delivery results in DynamoDB:', {
+                      messageId: messageBody.messageId,
+                      correlationId,
+                      error: deliveryUpdateError.message,
+                      errorCode: deliveryUpdateError.code,
+                      outcome: outcome,
+                      willContinue: true // Continue processing to maintain message flow
+                    });
+
+                    // Still add result but mark the update failure
                     results.push({
                       messageId: record.messageId,
-                      status: 'delivered',
+                      status: outcome.success ? 'delivered' : 'failed',
                       correlationId,
+                      deliveryUpdateFailed: true,
+                      deliveryUpdateError: deliveryUpdateError.message,
+                      outcome: outcome,
                       processingStartedAt: updateResult.Attributes.processingStartedAt,
                       httpStatus: httpResponse.status,
                       httpStatusText: httpResponse.statusText,
-                      responseTime: requestDuration,
-                      deliveredAt: new Date().toISOString(),
-                      outcome: outcome // Include structured outcome data
-                    });
-                  } else {
-                    console.error('Message delivery failed:', {
-                      messageId: messageBody.messageId,
-                      correlationId,
-                      httpStatus: httpResponse.status,
-                      httpStatusText: httpResponse.statusText,
-                      responseTime: requestDuration,
-                      category: outcome.category,
-                      retryEligible: outcome.retryEligible,
-                      errorDetails: outcome.errorDetails
-                    });
-
-                    results.push({
-                      messageId: record.messageId,
-                      status: 'failed',
-                      correlationId,
-                      error: outcome.category,
-                      httpStatus: httpResponse.status,
-                      httpStatusText: httpResponse.statusText,
-                      responseTime: requestDuration,
-                      retryEligible: outcome.retryEligible,
-                      outcome: outcome // Include structured outcome data
+                      responseTime: requestDuration
                     });
                   }
 
