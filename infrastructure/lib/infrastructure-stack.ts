@@ -752,13 +752,115 @@ export class InfrastructureStack extends cdk.Stack {
             averageProcessingTime: totalProcessingTime / Math.max(event.Records?.length || 1, 1)
           });
 
+          // Message acknowledgment and deletion phase
+          const deletionStartTime = Date.now();
+          let deletedCount = 0;
+          let deletionErrors = 0;
+
+          if (successful > 0) {
+            // Collect successful message receipts for deletion
+            const successfulMessageReceipts = [];
+            for (let i = 0; i < event.Records.length; i++) {
+              const record = event.Records[i];
+              const result = results[i];
+              if (result.status === 'processing_started') {
+                successfulMessageReceipts.push({
+                  Id: \`msg-\${i}\`,
+                  ReceiptHandle: record.receiptHandle
+                });
+              }
+            }
+
+            console.log('Preparing message deletion:', {
+              batchId: startTime.toString(),
+              messagesToDelete: successfulMessageReceipts.length,
+              successfulMessageReceipts: successfulMessageReceipts.map(r => ({ id: r.Id, receiptHandle: r.ReceiptHandle?.substring(0, 20) + '...' }))
+            });
+
+            // Delete messages in batches (AWS limit is 10 per batch)
+            const batchSize = 10;
+            for (let i = 0; i < successfulMessageReceipts.length; i += batchSize) {
+              const batch = successfulMessageReceipts.slice(i, i + batchSize);
+
+              try {
+                const AWS = require('aws-sdk');
+                const sqs = new AWS.SQS();
+
+                const deleteParams = {
+                  QueueUrl: process.env.SQS_QUEUE_URL,
+                  Entries: batch
+                };
+
+                const deleteResult = await sqs.deleteMessageBatch(deleteParams).promise();
+
+                const successfulDeletes = deleteResult.Successful?.length || 0;
+                const failedDeletes = deleteResult.Failed?.length || 0;
+
+                deletedCount += successfulDeletes;
+                deletionErrors += failedDeletes;
+
+                console.log('Batch deletion completed:', {
+                  batchId: startTime.toString(),
+                  batchStartIndex: i,
+                  batchSize: batch.length,
+                  successfulDeletes,
+                  failedDeletes,
+                  totalDeleted: deletedCount,
+                  totalErrors: deletionErrors
+                });
+
+                // Log failed deletions for debugging
+                if (failedDeletes > 0) {
+                  console.error('Failed deletions in batch:', {
+                    batchId: startTime.toString(),
+                    failedEntries: deleteResult.Failed
+                  });
+                }
+
+              } catch (deleteError) {
+                console.error('Batch deletion failed:', {
+                  batchId: startTime.toString(),
+                  batchStartIndex: i,
+                  batchSize: batch.length,
+                  error: deleteError.message,
+                  errorCode: deleteError.code,
+                  stack: deleteError.stack?.substring(0, 500)
+                });
+                deletionErrors += batch.length;
+              }
+            }
+
+          } else {
+            console.log('No successful messages to delete:', {
+              batchId: startTime.toString(),
+              successful,
+              failed
+            });
+          }
+
+          const deletionTime = Date.now() - deletionStartTime;
+
+          console.log('Message acknowledgment and deletion complete:', {
+            batchId: startTime.toString(),
+            totalMessages: event.Records?.length || 0,
+            successful,
+            failed,
+            deletedCount,
+            deletionErrors,
+            deletionTime,
+            remainingInQueue: Math.max(0, successful - deletedCount)
+          });
+
           return {
             statusCode: 200,
             batchId: startTime.toString(),
             processedMessages: results.length,
             successful,
             failed,
+            deletedCount,
+            deletionErrors,
             totalProcessingTime,
+            deletionTime,
             results
           };
         };
