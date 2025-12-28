@@ -572,60 +572,193 @@ export class InfrastructureStack extends cdk.Stack {
           console.log('Worker processing SQS messages:', {
             messageCount: event.Records?.length || 0,
             logLevel: process.env.LOG_LEVEL,
-            serviceName: process.env.SERVICE_NAME
+            serviceName: process.env.SERVICE_NAME,
+            batchId: Date.now().toString()
           });
 
-          // Process each SQS message
           const results = [];
+          const startTime = Date.now();
+
+          // Process each SQS message in the batch
           for (const record of event.Records || []) {
+            const messageStartTime = Date.now();
+            const correlationId = record.messageAttributes?.correlationId?.stringValue || 'unknown';
+
             try {
               console.log('Processing message:', {
                 messageId: record.messageId,
                 receiptHandle: record.receiptHandle?.substring(0, 20) + '...',
-                correlationId: record.messageAttributes?.correlationId?.stringValue
+                correlationId,
+                batchId: startTime.toString()
               });
 
-              // Parse message body
-              const messageBody = JSON.parse(record.body);
-              console.log('Message payload:', {
+              // Parse message body and extract delivery information
+              let messageBody;
+              try {
+                messageBody = JSON.parse(record.body);
+              } catch (parseError) {
+                console.error('Failed to parse message body:', {
+                  messageId: record.messageId,
+                  correlationId,
+                  error: parseError.message,
+                  bodyPreview: record.body?.substring(0, 200)
+                });
+
+                results.push({
+                  messageId: record.messageId,
+                  status: 'failed',
+                  error: 'INVALID_JSON',
+                  correlationId
+                });
+                continue;
+              }
+
+              // Validate required message fields
+              const requiredFields = ['messageId', 'targetUrl', 'method', 'correlationId'];
+              const missingFields = requiredFields.filter(field => !messageBody[field]);
+
+              if (missingFields.length > 0) {
+                console.error('Message missing required fields:', {
+                  messageId: record.messageId,
+                  correlationId,
+                  missingFields
+                });
+
+                results.push({
+                  messageId: record.messageId,
+                  status: 'failed',
+                  error: 'MISSING_REQUIRED_FIELDS',
+                  correlationId,
+                  missingFields
+                });
+                continue;
+              }
+
+              // Log delivery information for debugging
+              console.log('Message delivery details:', {
                 messageId: messageBody.messageId,
                 targetUrl: messageBody.targetUrl,
-                method: messageBody.method
+                method: messageBody.method,
+                correlationId: messageBody.correlationId,
+                hasHeaders: !!messageBody.headers,
+                hasBody: !!messageBody.body,
+                timestamp: messageBody.timestamp,
+                senderId: messageBody.senderId
               });
 
-              // TODO: Implement HTTP request execution logic
-              // This will be implemented in the next task
+              // Update message status from QUEUED to PROCESSING
+              try {
+                const AWS = require('aws-sdk');
+                const dynamodb = new AWS.DynamoDB.DocumentClient();
 
-              results.push({
-                messageId: record.messageId,
-                status: 'processed',
-                result: 'success'
-              });
+                // Construct composite key for DynamoDB lookup
+                const partitionKey = messageBody.messageId + '#' + messageBody.senderId;
+                const sortKey = messageBody.timestamp + '#' + messageBody.targetUrl;
+
+                console.log('Updating message status to PROCESSING:', {
+                  messageId: messageBody.messageId,
+                  correlationId,
+                  partitionKey,
+                  sortKey,
+                  tableName: process.env.DYNAMODB_TABLE_NAME
+                });
+
+                const updateParams = {
+                  TableName: process.env.DYNAMODB_TABLE_NAME || 'NotificationMessages',
+                  Key: {
+                    pk: partitionKey,
+                    sk: sortKey
+                  },
+                  UpdateExpression: 'SET #status = :newStatus, processingStartedAt = :processingStartedAt, lastUpdatedAt = :lastUpdatedAt',
+                  ConditionExpression: 'attribute_exists(pk) AND #status = :currentStatus',
+                  ExpressionAttributeNames: {
+                    '#status': 'status'
+                  },
+                  ExpressionAttributeValues: {
+                    ':newStatus': 'PROCESSING',
+                    ':currentStatus': 'QUEUED',
+                    ':processingStartedAt': new Date().toISOString(),
+                    ':lastUpdatedAt': new Date().toISOString()
+                  },
+                  ReturnValues: 'ALL_NEW'
+                };
+
+                const updateResult = await dynamodb.update(updateParams).promise();
+
+                console.log('Message status updated to PROCESSING:', {
+                  messageId: messageBody.messageId,
+                  correlationId,
+                  previousStatus: 'QUEUED',
+                  newStatus: updateResult.Attributes.status,
+                  processingStartedAt: updateResult.Attributes.processingStartedAt,
+                  attempts: updateResult.Attributes.attempts
+                });
+
+                results.push({
+                  messageId: record.messageId,
+                  status: 'processing_started',
+                  correlationId,
+                  processingStartedAt: updateResult.Attributes.processingStartedAt
+                });
+
+              } catch (updateError) {
+                console.error('Failed to update message status:', {
+                  messageId: messageBody.messageId,
+                  correlationId,
+                  error: updateError.message,
+                  errorCode: updateError.code,
+                  tableName: process.env.DYNAMODB_TABLE_NAME
+                });
+
+                results.push({
+                  messageId: record.messageId,
+                  status: 'failed',
+                  error: 'STATUS_UPDATE_FAILED',
+                  correlationId,
+                  updateError: updateError.message
+                });
+                continue;
+              }
 
             } catch (error) {
               console.error('Error processing message:', {
                 messageId: record.messageId,
+                correlationId,
                 error: error.message,
-                correlationId: record.messageAttributes?.correlationId?.stringValue
+                stack: error.stack?.substring(0, 500),
+                processingTime: Date.now() - messageStartTime
               });
 
               results.push({
                 messageId: record.messageId,
                 status: 'failed',
-                error: error.message
+                error: error.message,
+                correlationId,
+                processingTime: Date.now() - messageStartTime
               });
             }
           }
 
+          const totalProcessingTime = Date.now() - startTime;
+          const successful = results.filter(r => r.status === 'processing_started').length;
+          const failed = results.filter(r => r.status === 'failed').length;
+
           console.log('Worker processing complete:', {
+            batchId: startTime.toString(),
             totalMessages: event.Records?.length || 0,
-            successful: results.filter(r => r.status === 'processed').length,
-            failed: results.filter(r => r.status === 'failed').length
+            successful,
+            failed,
+            totalProcessingTime,
+            averageProcessingTime: totalProcessingTime / Math.max(event.Records?.length || 1, 1)
           });
 
           return {
             statusCode: 200,
+            batchId: startTime.toString(),
             processedMessages: results.length,
+            successful,
+            failed,
+            totalProcessingTime,
             results
           };
         };
