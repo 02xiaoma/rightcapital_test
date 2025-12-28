@@ -175,11 +175,93 @@ export class InfrastructureStack extends cdk.Stack {
             return createErrorResponse('VALIDATION_ERROR', 'body must be a string or object if provided');
           }
 
-          // Validation successful - return success response
-          console.log('Request validation successful:', {
+          // Perform deduplication check using DynamoDB
+          console.log('Performing deduplication check:', {
             messageId: requestBody.messageId,
             senderId: requestBody.senderId,
-            method: requestBody.method
+            logLevel: process.env.LOG_LEVEL,
+            serviceName: process.env.SERVICE_NAME
+          });
+
+          // Construct composite key
+          const partitionKey = requestBody.messageId + '#' + requestBody.senderId;
+          const sortKey = requestBody.timestamp + '#' + requestBody.targetUrl;
+
+          try {
+            const AWS = require('aws-sdk');
+            const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+            const getItemParams = {
+              TableName: process.env.DYNAMODB_TABLE_NAME || 'NotificationMessages',
+              Key: {
+                pk: partitionKey,
+                sk: sortKey
+              }
+            };
+
+            console.log('Querying DynamoDB for deduplication:', {
+              partitionKey,
+              sortKey,
+              tableName: getItemParams.TableName
+            });
+
+            const result = await dynamodb.get(getItemParams).promise();
+
+            if (result.Item) {
+              // Duplicate message found - return success (idempotent)
+              console.log('Duplicate message detected:', {
+                messageId: requestBody.messageId,
+                existingItem: result.Item,
+                duplicateDetected: true
+              });
+
+              return {
+                statusCode: 200,
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                  'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                },
+                body: JSON.stringify({
+                  message: 'Duplicate message accepted (idempotent)',
+                  requestId: event.requestContext?.requestId || 'unknown',
+                  timestamp: new Date().toISOString(),
+                  duplicateDetected: true,
+                  messageId: requestBody.messageId,
+                  senderId: requestBody.senderId
+                })
+              };
+            }
+
+            // No duplicate found - proceed with processing
+            console.log('No duplicate found, proceeding with processing:', {
+              messageId: requestBody.messageId,
+              duplicateDetected: false
+            });
+
+          } catch (error) {
+            // DynamoDB error - log and continue processing (fail open for availability)
+            console.error('DynamoDB deduplication check failed:', {
+              error: error.message,
+              messageId: requestBody.messageId,
+              senderId: requestBody.senderId,
+              tableName: process.env.DYNAMODB_TABLE_NAME
+            });
+
+            // For production, you might want to return an error instead of continuing
+            // return createErrorResponse('DEDUPLICATION_ERROR', 'Failed to check for duplicate messages');
+
+            // For now, continue processing if deduplication fails
+            console.log('Continuing processing despite deduplication failure');
+          }
+
+          // Validation and deduplication successful - return success response
+          console.log('Request validation and deduplication successful:', {
+            messageId: requestBody.messageId,
+            senderId: requestBody.senderId,
+            method: requestBody.method,
+            duplicateDetected: false
           });
 
           return {
@@ -194,6 +276,7 @@ export class InfrastructureStack extends cdk.Stack {
               message: 'Request validation successful',
               requestId: event.requestContext?.requestId || 'unknown',
               timestamp: new Date().toISOString(),
+              duplicateDetected: false,
               validatedData: {
                 messageId: requestBody.messageId,
                 senderId: requestBody.senderId,
@@ -349,6 +432,7 @@ export class InfrastructureStack extends cdk.Stack {
     // Add structured logging environment variables to Lambda
     this.function.addEnvironment('LOG_LEVEL', 'INFO');
     this.function.addEnvironment('SERVICE_NAME', 'notification-api');
+    this.function.addEnvironment('DYNAMODB_TABLE_NAME', this.table.tableName);
 
     // Configure API Gateway access logging
     const accessLogGroup = new logs.LogGroup(this, 'ApiGatewayAccessLogs', {
