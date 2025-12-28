@@ -9,6 +9,7 @@ import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
+import * as sns from 'aws-cdk-lib/aws-sns';
 
 export class InfrastructureStack extends cdk.Stack {
   public readonly table: dynamodb.TableV2;
@@ -87,15 +88,46 @@ export class InfrastructureStack extends cdk.Stack {
       comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
     });
 
-    // Add CloudWatch alarm for DLQ depth
+    // Create SNS topic for DLQ alerts
+    const dlqSnsTopic = new sns.Topic(this, 'DLQAlertTopic', {
+      displayName: 'DLQ Alert Notifications',
+      topicName: `${this.stackName}-DLQ-Alerts`,
+    });
+
+    // Add CloudWatch alarms for DLQ monitoring with different severity levels
     const dlqDepthAlarm = new cloudwatch.Alarm(this, 'DLQDepthAlarm', {
       alarmName: `${this.stackName}-DLQ-QueueDepth`,
-      alarmDescription: 'Dead Letter Queue has messages requiring attention',
+      alarmDescription: 'Dead Letter Queue has messages requiring immediate attention',
       metric: this.dlq.metricApproximateNumberOfMessagesVisible(),
       threshold: 1, // Alert even on single dead letter message
       evaluationPeriods: 1,
       comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
     });
+
+    // High severity alarm for significant DLQ accumulation
+    const dlqHighDepthAlarm = new cloudwatch.Alarm(this, 'DLQHighDepthAlarm', {
+      alarmName: `${this.stackName}-DLQ-High-QueueDepth`,
+      alarmDescription: 'Dead Letter Queue has significant accumulation - immediate investigation required',
+      metric: this.dlq.metricApproximateNumberOfMessagesVisible(),
+      threshold: 10, // Alert when more than 10 messages accumulate
+      evaluationPeriods: 2,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+    });
+
+    // DLQ age alarm to detect messages not being processed
+    const dlqOldestMessageAlarm = new cloudwatch.Alarm(this, 'DLQOldestMessageAlarm', {
+      alarmName: `${this.stackName}-DLQ-OldestMessageAge`,
+      alarmDescription: 'Dead Letter Queue contains messages older than 1 hour - investigation needed',
+      metric: this.dlq.metricApproximateAgeOfOldestMessage(),
+      threshold: 3600, // 1 hour in seconds
+      evaluationPeriods: 3,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+    });
+
+    // Connect alarms to SNS topic for notifications
+    dlqDepthAlarm.addAlarmAction(new cloudwatchActions.SnsAction(dlqSnsTopic));
+    dlqHighDepthAlarm.addAlarmAction(new cloudwatchActions.SnsAction(dlqSnsTopic));
+    dlqOldestMessageAlarm.addAlarmAction(new cloudwatchActions.SnsAction(dlqSnsTopic));
 
     // Create Lambda function for API handler
     this.function = new lambda.Function(this, 'ApiHandlerFunction', {
@@ -1875,6 +1907,50 @@ export class InfrastructureStack extends cdk.Stack {
       })
     );
 
+    // Create dedicated DLQ monitoring dashboard
+    const dlqDashboard = new cloudwatch.Dashboard(this, 'DLQMonitoringDashboard', {
+      dashboardName: 'NotificationSystem-DLQ-Monitoring',
+    });
+
+    // Add DLQ monitoring widgets to dashboard
+    dlqDashboard.addWidgets(
+      // DLQ depth monitoring
+      new cloudwatch.GraphWidget({
+        title: 'DLQ Message Count',
+        left: [this.dlq.metricApproximateNumberOfMessagesVisible()],
+        width: 12,
+      }),
+      new cloudwatch.GraphWidget({
+        title: 'DLQ Oldest Message Age',
+        left: [this.dlq.metricApproximateAgeOfOldestMessage()],
+        width: 12,
+      }),
+      // DLQ message flow
+      new cloudwatch.GraphWidget({
+        title: 'DLQ Messages Received',
+        left: [this.dlq.metricNumberOfMessagesReceived()],
+        width: 12,
+      }),
+      new cloudwatch.GraphWidget({
+        title: 'DLQ Messages Sent (Redrive)',
+        left: [this.dlq.metricNumberOfMessagesSent()],
+        width: 12,
+      }),
+      // Main queue vs DLQ comparison
+      new cloudwatch.GraphWidget({
+        title: 'Queue Depth Comparison',
+        left: [this.queue.metricApproximateNumberOfMessagesVisible()],
+        right: [this.dlq.metricApproximateNumberOfMessagesVisible()],
+        width: 24,
+      }),
+      // DLQ processing metrics
+      new cloudwatch.GraphWidget({
+        title: 'DLQ Message Processing',
+        left: [this.dlq.metricNumberOfMessagesDeleted()], // Messages manually processed
+        width: 12,
+      })
+    );
+
     // Add resource tags for cost allocation
     cdk.Tags.of(this).add('Environment', 'development');
     cdk.Tags.of(this).add('Project', 'notification-system');
@@ -1904,6 +1980,18 @@ export class InfrastructureStack extends cdk.Stack {
       value: apiKey.keyId,
       description: 'API Gateway API key ID for authentication',
       exportName: `${this.stackName}-ApiKeyId`,
+    });
+
+    new cdk.CfnOutput(this, 'DLQDashboardUrl', {
+      value: `https://${cdk.Aws.REGION}.console.aws.amazon.com/cloudwatch/home?region=${cdk.Aws.REGION}#dashboards:name=${dlqDashboard.dashboardName}`,
+      description: 'DLQ monitoring dashboard URL',
+      exportName: `${this.stackName}-DLQDashboardUrl`,
+    });
+
+    new cdk.CfnOutput(this, 'DLQAlertTopicArn', {
+      value: dlqSnsTopic.topicArn,
+      description: 'SNS topic ARN for DLQ alert notifications',
+      exportName: `${this.stackName}-DLQAlertTopicArn`,
     });
 
     console.log('Infrastructure stack integration complete with monitoring and logging configured');
