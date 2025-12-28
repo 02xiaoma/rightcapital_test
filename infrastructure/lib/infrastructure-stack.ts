@@ -568,6 +568,8 @@ export class InfrastructureStack extends cdk.Stack {
       runtime: lambda.Runtime.NODEJS_18_X,
       code: lambda.Code.fromInline(`
         // Worker Lambda handler for SQS message processing
+        const axios = require('axios');
+
         exports.handler = async (event) => {
           console.log('Worker processing SQS messages:', {
             messageCount: event.Records?.length || 0,
@@ -694,12 +696,128 @@ export class InfrastructureStack extends cdk.Stack {
                   attempts: updateResult.Attributes.attempts
                 });
 
-                results.push({
-                  messageId: record.messageId,
-                  status: 'processing_started',
-                  correlationId,
-                  processingStartedAt: updateResult.Attributes.processingStartedAt
-                });
+                // Execute HTTP request to external API
+                try {
+                  console.log('Executing HTTP request:', {
+                    messageId: messageBody.messageId,
+                    correlationId,
+                    method: messageBody.method,
+                    targetUrl: messageBody.targetUrl,
+                    hasHeaders: !!messageBody.headers,
+                    hasBody: !!messageBody.body,
+                    contentLength: messageBody.body ? JSON.stringify(messageBody.body).length : 0
+                  });
+
+                  const requestStartTime = Date.now();
+
+                  // Prepare axios request configuration
+                  const axiosConfig = {
+                    method: messageBody.method || 'POST',
+                    url: messageBody.targetUrl,
+                    timeout: 10000, // 10-second timeout for external API calls
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'User-Agent': 'NotificationSystem/1.0',
+                      'X-Correlation-ID': correlationId,
+                      'X-Message-ID': messageBody.messageId,
+                      'X-Sender-ID': messageBody.senderId,
+                      ...messageBody.headers
+                    },
+                    // Only include data if body is provided
+                    ...(messageBody.body && { data: messageBody.body })
+                  };
+
+                  console.log('HTTP request configuration:', {
+                    messageId: messageBody.messageId,
+                    correlationId,
+                    method: axiosConfig.method,
+                    url: axiosConfig.url,
+                    timeout: axiosConfig.timeout,
+                    headerCount: Object.keys(axiosConfig.headers).length,
+                    hasData: !!axiosConfig.data
+                  });
+
+                  // Execute HTTP request
+                  const httpResponse = await axios(axiosConfig);
+
+                  const requestDuration = Date.now() - requestStartTime;
+
+                  console.log('HTTP request successful:', {
+                    messageId: messageBody.messageId,
+                    correlationId,
+                    statusCode: httpResponse.status,
+                    statusText: httpResponse.statusText,
+                    responseTime: requestDuration,
+                    contentLength: httpResponse.data ? JSON.stringify(httpResponse.data).length : 0,
+                    hasResponseHeaders: !!httpResponse.headers
+                  });
+
+                  // Determine success based on HTTP status code (2xx range)
+                  const isSuccess = httpResponse.status >= 200 && httpResponse.status < 300;
+
+                  if (isSuccess) {
+                    console.log('Message delivery successful:', {
+                      messageId: messageBody.messageId,
+                      correlationId,
+                      httpStatus: httpResponse.status,
+                      responseTime: requestDuration
+                    });
+
+                    results.push({
+                      messageId: record.messageId,
+                      status: 'delivered',
+                      correlationId,
+                      processingStartedAt: updateResult.Attributes.processingStartedAt,
+                      httpStatus: httpResponse.status,
+                      httpStatusText: httpResponse.statusText,
+                      responseTime: requestDuration,
+                      deliveredAt: new Date().toISOString()
+                    });
+                  } else {
+                    console.error('HTTP request returned error status:', {
+                      messageId: messageBody.messageId,
+                      correlationId,
+                      httpStatus: httpResponse.status,
+                      httpStatusText: httpResponse.statusText,
+                      responseTime: requestDuration
+                    });
+
+                    results.push({
+                      messageId: record.messageId,
+                      status: 'failed',
+                      correlationId,
+                      error: 'HTTP_ERROR_STATUS',
+                      httpStatus: httpResponse.status,
+                      httpStatusText: httpResponse.statusText,
+                      responseTime: requestDuration
+                    });
+                  }
+
+                } catch (httpError) {
+                  const requestDuration = Date.now() - requestStartTime;
+
+                  console.error('HTTP request failed:', {
+                    messageId: messageBody.messageId,
+                    correlationId,
+                    error: httpError.message,
+                    errorCode: httpError.code,
+                    responseTime: requestDuration,
+                    isTimeout: httpError.code === 'ECONNABORTED',
+                    statusCode: httpError.response?.status
+                  });
+
+                  results.push({
+                    messageId: record.messageId,
+                    status: 'failed',
+                    correlationId,
+                    error: 'HTTP_REQUEST_FAILED',
+                    httpError: httpError.message,
+                    httpErrorCode: httpError.code,
+                    httpStatus: httpError.response?.status,
+                    responseTime: requestDuration,
+                    isTimeout: httpError.code === 'ECONNABORTED'
+                  });
+                }
 
               } catch (updateError) {
                 console.error('Failed to update message status:', {
@@ -758,12 +876,12 @@ export class InfrastructureStack extends cdk.Stack {
           let deletionErrors = 0;
 
           if (successful > 0) {
-            // Collect successful message receipts for deletion
+            // Collect successful message receipts for deletion (delivered messages)
             const successfulMessageReceipts = [];
             for (let i = 0; i < event.Records.length; i++) {
               const record = event.Records[i];
               const result = results[i];
-              if (result.status === 'processing_started') {
+              if (result.status === 'delivered') {
                 successfulMessageReceipts.push({
                   Id: \`msg-\${i}\`,
                   ReceiptHandle: record.receiptHandle
