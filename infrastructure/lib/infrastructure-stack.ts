@@ -39,11 +39,14 @@ export class InfrastructureStack extends cdk.Stack {
 
     console.log('DynamoDB table created:', this.table.tableName);
 
-    // Create SQS queue for message buffering
+    // Create SQS queue for message buffering with optimized settings for high-throughput
     this.queue = new sqs.Queue(this, 'MessageQueue', {
-      visibilityTimeout: cdk.Duration.seconds(30),
-      retentionPeriod: cdk.Duration.days(4),
-      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      visibilityTimeout: cdk.Duration.seconds(30), // Match Lambda timeout to prevent duplicate processing
+      retentionPeriod: cdk.Duration.days(4), // 4 days retention for adequate processing buffer
+      deliveryDelay: cdk.Duration.seconds(0), // Immediate delivery for high-throughput scenarios
+      receiveMessageWaitTime: cdk.Duration.seconds(20), // Long polling for efficiency (max 20 seconds)
+      maxMessageSizeBytes: 262144, // Maximum message size (256 KB) for comprehensive payloads
+      encryption: sqs.QueueEncryption.SQS_MANAGED, // Server-side encryption for security
       removalPolicy: cdk.RemovalPolicy.DESTROY, // For development
     });
 
