@@ -374,42 +374,90 @@ export class InfrastructureStack extends cdk.Stack {
                 messageId: sendMessageParams.MessageAttributes.messageId.StringValue
               });
 
-              // Return success response with queuing confirmation
-              console.log('Request validation, deduplication, storage, and queuing successful:', {
+              // Update message status to QUEUED after successful SQS send
+              console.log('Updating message status to QUEUED:', {
                 messageId: requestBody.messageId,
-                senderId: requestBody.senderId,
-                method: requestBody.method,
-                duplicateDetected: false,
-                stored: true,
-                queued: true
+                currentStatus: 'PENDING',
+                newStatus: 'QUEUED'
               });
 
-              return {
-                statusCode: 200,
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Access-Control-Allow-Origin': '*',
-                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                  'Access-Control-Allow-Methods': 'POST,OPTIONS'
-                },
-                body: JSON.stringify({
-                  message: 'Request validation successful',
-                  requestId: event.requestContext?.requestId || 'unknown',
-                  timestamp: new Date().toISOString(),
+              try {
+                const updateParams = {
+                  TableName: process.env.DYNAMODB_TABLE_NAME || 'NotificationMessages',
+                  Key: {
+                    pk: messageMetadata.pk,
+                    sk: messageMetadata.sk
+                  },
+                  UpdateExpression: 'SET #status = :newStatus',
+                  ConditionExpression: 'attribute_exists(pk) AND #status = :currentStatus',
+                  ExpressionAttributeNames: {
+                    '#status': 'status'
+                  },
+                  ExpressionAttributeValues: {
+                    ':newStatus': 'QUEUED',
+                    ':currentStatus': 'PENDING'
+                  },
+                  ReturnValues: 'ALL_NEW'
+                };
+
+                const updateResult = await dynamodb.update(updateParams).promise();
+
+                console.log('Message status updated to QUEUED:', {
+                  messageId: requestBody.messageId,
+                  previousStatus: 'PENDING',
+                  newStatus: updateResult.Attributes.status,
+                  updatedAt: new Date().toISOString()
+                });
+
+                // Return success response with queuing and status update confirmation
+                console.log('Request validation, deduplication, storage, queuing, and status update successful:', {
+                  messageId: requestBody.messageId,
+                  senderId: requestBody.senderId,
+                  method: requestBody.method,
                   duplicateDetected: false,
                   stored: true,
                   queued: true,
+                  statusUpdated: true
+                });
+
+                return {
+                  statusCode: 200,
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                    'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                  },
+                  body: JSON.stringify({
+                    message: 'Request validation successful',
+                    requestId: event.requestContext?.requestId || 'unknown',
+                    timestamp: new Date().toISOString(),
+                    duplicateDetected: false,
+                    stored: true,
+                    queued: true,
+                    statusUpdated: true,
+                    messageId: requestBody.messageId,
+                    storedMessage: {
+                      messageId: updateResult.Attributes.messageId,
+                      senderId: updateResult.Attributes.senderId,
+                      status: updateResult.Attributes.status,
+                      attempts: updateResult.Attributes.attempts,
+                      ttl: updateResult.Attributes.ttl,
+                      createdAt: updateResult.Attributes.createdAt
+                    }
+                  })
+                };
+
+              } catch (updateError) {
+                // Status update failed - rollback by not returning success
+                console.error('Status update failed:', {
+                  error: updateError.message,
                   messageId: requestBody.messageId,
-                  storedMessage: {
-                    messageId: messageMetadata.messageId,
-                    senderId: messageMetadata.senderId,
-                    status: messageMetadata.status,
-                    attempts: messageMetadata.attempts,
-                    ttl: messageMetadata.ttl,
-                    createdAt: messageMetadata.createdAt
-                  }
-                })
-              };
+                  attemptedStatus: 'QUEUED'
+                });
+
+                return createErrorResponse('SYSTEM_ERROR', 'An internal server error occurred');
+              }
 
             } catch (error) {
               // SQS send operation failed - return error
