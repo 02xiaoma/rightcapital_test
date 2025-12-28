@@ -256,36 +256,107 @@ export class InfrastructureStack extends cdk.Stack {
             console.log('Continuing processing despite deduplication failure');
           }
 
-          // Validation and deduplication successful - return success response
-          console.log('Request validation and deduplication successful:', {
+          // Store message metadata in DynamoDB
+          console.log('Storing message metadata:', {
             messageId: requestBody.messageId,
             senderId: requestBody.senderId,
-            method: requestBody.method,
-            duplicateDetected: false
+            tableName: process.env.DYNAMODB_TABLE_NAME
           });
 
-          return {
-            statusCode: 200,
-            headers: {
-              'Content-Type': 'application/json',
-              'Access-Control-Allow-Origin': '*',
-              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-              'Access-Control-Allow-Methods': 'POST,OPTIONS'
-            },
-            body: JSON.stringify({
-              message: 'Request validation successful',
-              requestId: event.requestContext?.requestId || 'unknown',
-              timestamp: new Date().toISOString(),
+          try {
+            const AWS = require('aws-sdk');
+            const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+            // Calculate TTL (default 30 days from now)
+            const ttlSeconds = parseInt(process.env.MESSAGE_RETENTION_DAYS || '30') * 24 * 60 * 60;
+            const ttlTimestamp = Math.floor(Date.now() / 1000) + ttlSeconds;
+
+            // Prepare message metadata for storage
+            const messageMetadata = {
+              pk: requestBody.messageId + '#' + requestBody.senderId,
+              sk: requestBody.timestamp + '#' + requestBody.targetUrl,
+              messageId: requestBody.messageId,
+              senderId: requestBody.senderId,
+              timestamp: requestBody.timestamp,
+              targetUrl: requestBody.targetUrl,
+              status: 'PENDING',
+              attempts: 0,
+              ttl: ttlTimestamp,
+              createdAt: new Date().toISOString(),
+              requestId: event.requestContext?.requestId || 'unknown'
+            };
+
+            // Add optional fields if present
+            if (requestBody.method !== undefined) {
+              messageMetadata.method = requestBody.method;
+            }
+            if (requestBody.headers !== undefined) {
+              messageMetadata.headers = requestBody.headers;
+            }
+            if (requestBody.body !== undefined) {
+              messageMetadata.body = requestBody.body;
+            }
+
+            // Store message metadata
+            const putParams = {
+              TableName: process.env.DYNAMODB_TABLE_NAME || 'NotificationMessages',
+              Item: messageMetadata
+            };
+
+            await dynamodb.put(putParams).promise();
+
+            console.log('Message metadata stored successfully:', {
+              messageId: requestBody.messageId,
+              status: 'PENDING',
+              ttl: ttlTimestamp,
+              tableName: putParams.TableName
+            });
+
+            // Validation and deduplication successful - return success response
+            console.log('Request validation, deduplication, and storage successful:', {
+              messageId: requestBody.messageId,
+              senderId: requestBody.senderId,
+              method: requestBody.method,
               duplicateDetected: false,
-              validatedData: {
-                messageId: requestBody.messageId,
-                senderId: requestBody.senderId,
-                method: requestBody.method,
-                hasHeaders: !!requestBody.headers,
-                hasBody: !!requestBody.body
-              }
-            })
-          };
+              stored: true
+            });
+
+            return {
+              statusCode: 200,
+              headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+              },
+              body: JSON.stringify({
+                message: 'Request validation successful',
+                requestId: event.requestContext?.requestId || 'unknown',
+                timestamp: new Date().toISOString(),
+                duplicateDetected: false,
+                stored: true,
+                storedMessage: {
+                  messageId: messageMetadata.messageId,
+                  senderId: messageMetadata.senderId,
+                  status: messageMetadata.status,
+                  attempts: messageMetadata.attempts,
+                  ttl: messageMetadata.ttl,
+                  createdAt: messageMetadata.createdAt
+                }
+              })
+            };
+
+          } catch (error) {
+            // Storage operation failed - return error
+            console.error('Message storage failed:', {
+              error: error.message,
+              messageId: requestBody.messageId,
+              senderId: requestBody.senderId,
+              tableName: process.env.DYNAMODB_TABLE_NAME
+            });
+
+            return createErrorResponse('SYSTEM_ERROR', 'An internal server error occurred');
+          }
         };
       `),
       handler: 'index.handler',
@@ -433,6 +504,7 @@ export class InfrastructureStack extends cdk.Stack {
     this.function.addEnvironment('LOG_LEVEL', 'INFO');
     this.function.addEnvironment('SERVICE_NAME', 'notification-api');
     this.function.addEnvironment('DYNAMODB_TABLE_NAME', this.table.tableName);
+    this.function.addEnvironment('MESSAGE_RETENTION_DAYS', '30');
 
     // Configure API Gateway access logging
     const accessLogGroup = new logs.LogGroup(this, 'ApiGatewayAccessLogs', {
