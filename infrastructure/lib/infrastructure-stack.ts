@@ -3,6 +3,7 @@ import { Construct } from 'constructs';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as lambdaEventSources from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
@@ -665,6 +666,16 @@ export class InfrastructureStack extends cdk.Stack {
     // Attach policies to worker Lambda execution role
     this.workerFunction.addToRolePolicy(workerDynamoDBPolicy);
     this.workerFunction.addToRolePolicy(workerSQSPolicy);
+
+    // Configure SQS event source mapping for automatic message processing
+    this.workerFunction.addEventSource(new lambdaEventSources.SqsEventSource(this.queue, {
+      batchSize: 5, // Process 5 messages per batch for balanced throughput
+      maxConcurrency: 10, // Limit concurrent executions to prevent overwhelming APIs
+      maxBatchingWindow: cdk.Duration.seconds(5), // Wait up to 5 seconds for batch completion
+      reportBatchItemFailures: true, // Enable partial batch responses for error handling
+    }));
+
+    console.log('SQS event source mapping configured for worker Lambda');
 
     // Add IAM policies for API handler function
     // DynamoDB policy
