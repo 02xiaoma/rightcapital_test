@@ -5,6 +5,7 @@ import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 
 export class InfrastructureStack extends cdk.Stack {
   public readonly table: dynamodb.TableV2;
@@ -16,6 +17,8 @@ export class InfrastructureStack extends cdk.Stack {
   public readonly function: lambda.Function;
   public readonly functionName: string;
   public readonly functionArn: string;
+  public readonly api: apigateway.RestApi;
+  public readonly apiEndpoint: string;
 
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
@@ -113,14 +116,57 @@ export class InfrastructureStack extends cdk.Stack {
         NODE_ENV: 'production'
       },
       logRetention: logs.RetentionDays.ONE_MONTH,
-      removalPolicy: cdk.RemovalPolicy.DESTROY, // For development
     });
 
     console.log('Lambda function created:', this.function.functionName);
 
-    // Export function properties for API Gateway integration
+    // Create API Gateway REST API
+    this.api = new apigateway.RestApi(this, 'NotificationApi', {
+      restApiName: 'NotificationAPI',
+      description: 'API for submitting notification requests',
+      deployOptions: {
+        stageName: 'prod',
+        throttlingRateLimit: 100,
+        throttlingBurstLimit: 200,
+      },
+      defaultCorsPreflightOptions: {
+        allowOrigins: apigateway.Cors.ALL_ORIGINS,
+        allowMethods: apigateway.Cors.ALL_METHODS,
+        allowHeaders: ['Content-Type', 'X-Amz-Date', 'Authorization', 'X-Api-Key'],
+      },
+    });
+
+    // Create /message resource
+    const messageResource = this.api.root.addResource('message');
+
+    // Add POST method with Lambda integration
+    messageResource.addMethod('POST', new apigateway.LambdaIntegration(this.function));
+
+    // Create usage plan and API key for rate limiting
+    const usagePlan = this.api.addUsagePlan('NotificationUsagePlan', {
+      name: 'Notification API Usage Plan',
+      throttle: {
+        rateLimit: 10,
+        burstLimit: 20,
+      },
+      quota: {
+        limit: 10000,
+        period: apigateway.Period.DAY,
+      },
+    });
+
+    const apiKey = this.api.addApiKey('NotificationApiKey', {
+      apiKeyName: 'Notification API Key',
+    });
+
+    usagePlan.addApiKey(apiKey);
+
+    console.log('API Gateway created:', this.api.restApiName);
+
+    // Export properties
     this.functionName = this.function.functionName;
     this.functionArn = this.function.functionArn;
+    this.apiEndpoint = this.api.url;
 
     // Export table properties for cross-stack references
     this.tableName = this.table.tableName;
@@ -162,6 +208,12 @@ export class InfrastructureStack extends cdk.Stack {
       value: this.function.functionArn,
       description: 'Lambda function ARN for API handler',
       exportName: `${this.stackName}-FunctionArn`,
+    });
+
+    new cdk.CfnOutput(this, 'ApiEndpoint', {
+      value: this.api.url,
+      description: 'API Gateway endpoint URL for notification submission',
+      exportName: `${this.stackName}-ApiEndpoint`,
     });
   }
 }
