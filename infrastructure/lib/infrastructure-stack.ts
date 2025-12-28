@@ -63,8 +63,8 @@ export class InfrastructureStack extends cdk.Stack {
     this.function = new lambda.Function(this, 'ApiHandlerFunction', {
       runtime: lambda.Runtime.NODEJS_18_X,
       code: lambda.Code.fromInline(`
-        // Validation helper functions
-        function createErrorResponse(error, message, statusCode = 400) {
+        // Enhanced error response formatting with structured error codes
+        function createErrorResponse(errorCode, message, statusCode = 400) {
           return {
             statusCode,
             headers: {
@@ -74,7 +74,7 @@ export class InfrastructureStack extends cdk.Stack {
               'Access-Control-Allow-Methods': 'POST,OPTIONS'
             },
             body: JSON.stringify({
-              error,
+              error: errorCode,
               message,
               timestamp: new Date().toISOString(),
               requestId: event.requestContext?.requestId || 'unknown'
