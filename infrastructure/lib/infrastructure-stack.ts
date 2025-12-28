@@ -63,28 +63,54 @@ export class InfrastructureStack extends cdk.Stack {
     this.function = new lambda.Function(this, 'ApiHandlerFunction', {
       runtime: lambda.Runtime.NODEJS_18_X,
       code: lambda.Code.fromInline(`
-        exports.handler = async (event) => {
-          console.log('Received event:', JSON.stringify(event, null, 2));
+        // Validation helper functions
+        function createErrorResponse(error, message, statusCode = 400) {
+          return {
+            statusCode,
+            headers: {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+              'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            },
+            body: JSON.stringify({
+              error,
+              message,
+              timestamp: new Date().toISOString(),
+              requestId: event.requestContext?.requestId || 'unknown'
+            })
+          };
+        }
 
-          // Basic response for POST requests
-          if (event.httpMethod === 'POST' || event.requestContext?.http?.method === 'POST') {
-            return {
-              statusCode: 200,
-              headers: {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-              },
-              body: JSON.stringify({
-                message: 'Request accepted',
-                timestamp: new Date().toISOString(),
-                requestId: event.requestContext?.requestId || 'unknown'
-              })
-            };
+        function isValidUrl(string) {
+          try {
+            new URL(string);
+            return true;
+          } catch (_) {
+            return false;
           }
+        }
 
-          // Handle OPTIONS for CORS
+        function isValidTimestamp(timestamp) {
+          const date = new Date(timestamp);
+          return date instanceof Date && !isNaN(date) && date.toISOString() === timestamp;
+        }
+
+        function isValidHttpMethod(method) {
+          const validMethods = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'];
+          return validMethods.includes(method.toUpperCase());
+        }
+
+        exports.handler = async (event) => {
+          console.log('Processing request validation:', {
+            requestId: event.requestContext?.requestId,
+            httpMethod: event.httpMethod || event.requestContext?.http?.method,
+            path: event.path,
+            logLevel: process.env.LOG_LEVEL,
+            serviceName: process.env.SERVICE_NAME
+          });
+
+          // Handle OPTIONS for CORS preflight
           if (event.httpMethod === 'OPTIONS' || event.requestContext?.http?.method === 'OPTIONS') {
             return {
               statusCode: 200,
@@ -97,16 +123,84 @@ export class InfrastructureStack extends cdk.Stack {
             };
           }
 
-          // Default response
+          // Parse JSON body
+          let requestBody;
+          try {
+            requestBody = JSON.parse(event.body || '{}');
+          } catch (error) {
+            console.error('JSON parsing error:', error);
+            return createErrorResponse('INVALID_JSON', 'Request body must be valid JSON');
+          }
+
+          // Validate required fields
+          const requiredFields = ['messageId', 'timestamp', 'senderId', 'targetUrl'];
+          for (const field of requiredFields) {
+            if (!requestBody[field]) {
+              return createErrorResponse('VALIDATION_ERROR', \`Missing required field: \${field}\`);
+            }
+          }
+
+          // Validate field types and formats
+          if (typeof requestBody.messageId !== 'string' || requestBody.messageId.trim() === '') {
+            return createErrorResponse('VALIDATION_ERROR', 'messageId must be a non-empty string');
+          }
+
+          if (!isValidTimestamp(requestBody.timestamp)) {
+            return createErrorResponse('VALIDATION_ERROR', 'timestamp must be a valid ISO 8601 datetime string');
+          }
+
+          if (typeof requestBody.senderId !== 'string' || requestBody.senderId.trim() === '') {
+            return createErrorResponse('VALIDATION_ERROR', 'senderId must be a non-empty string');
+          }
+
+          if (!isValidUrl(requestBody.targetUrl)) {
+            return createErrorResponse('VALIDATION_ERROR', 'targetUrl must be a valid URL');
+          }
+
+          // Validate optional fields
+          if (requestBody.method !== undefined) {
+            if (typeof requestBody.method !== 'string' || !isValidHttpMethod(requestBody.method)) {
+              return createErrorResponse('VALIDATION_ERROR', 'method must be a valid HTTP method (GET, POST, PUT, DELETE, PATCH, HEAD)');
+            }
+          } else {
+            // Default to POST if not provided
+            requestBody.method = 'POST';
+          }
+
+          if (requestBody.headers !== undefined && typeof requestBody.headers !== 'object') {
+            return createErrorResponse('VALIDATION_ERROR', 'headers must be an object if provided');
+          }
+
+          if (requestBody.body !== undefined && typeof requestBody.body !== 'string' && typeof requestBody.body !== 'object') {
+            return createErrorResponse('VALIDATION_ERROR', 'body must be a string or object if provided');
+          }
+
+          // Validation successful - return success response
+          console.log('Request validation successful:', {
+            messageId: requestBody.messageId,
+            senderId: requestBody.senderId,
+            method: requestBody.method
+          });
+
           return {
-            statusCode: 400,
+            statusCode: 200,
             headers: {
               'Content-Type': 'application/json',
-              'Access-Control-Allow-Origin': '*'
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+              'Access-Control-Allow-Methods': 'POST,OPTIONS'
             },
             body: JSON.stringify({
-              error: 'Method not allowed',
-              message: 'Only POST requests are supported'
+              message: 'Request validation successful',
+              requestId: event.requestContext?.requestId || 'unknown',
+              timestamp: new Date().toISOString(),
+              validatedData: {
+                messageId: requestBody.messageId,
+                senderId: requestBody.senderId,
+                method: requestBody.method,
+                hasHeaders: !!requestBody.headers,
+                hasBody: !!requestBody.body
+              }
             })
           };
         };
