@@ -321,30 +321,107 @@ export class InfrastructureStack extends cdk.Stack {
               stored: true
             });
 
-            return {
-              statusCode: 200,
-              headers: {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                'Access-Control-Allow-Methods': 'POST,OPTIONS'
-              },
-              body: JSON.stringify({
-                message: 'Request validation successful',
-                requestId: event.requestContext?.requestId || 'unknown',
-                timestamp: new Date().toISOString(),
+            // Send message to SQS queue for processing
+            console.log('Sending message to SQS queue:', {
+              messageId: requestBody.messageId,
+              queueUrl: process.env.SQS_QUEUE_URL
+            });
+
+            try {
+              const AWS = require('aws-sdk');
+              const sqs = new AWS.SQS();
+
+              // Prepare message payload for SQS
+              const queueMessage = {
+                messageId: requestBody.messageId,
+                senderId: requestBody.senderId,
+                timestamp: requestBody.timestamp,
+                targetUrl: requestBody.targetUrl,
+                method: requestBody.method || 'POST',
+                headers: requestBody.headers || {},
+                body: requestBody.body || '',
+                correlationId: event.requestContext?.requestId || 'unknown',
+                queuedAt: new Date().toISOString()
+              };
+
+              // Prepare message attributes for filtering and tracing
+              const messageAttributes = {
+                messageId: {
+                  DataType: 'String',
+                  StringValue: requestBody.messageId
+                },
+                senderId: {
+                  DataType: 'String',
+                  StringValue: requestBody.senderId
+                },
+                correlationId: {
+                  DataType: 'String',
+                  StringValue: event.requestContext?.requestId || 'unknown'
+                }
+              };
+
+              // Send message to SQS
+              const sendMessageParams = {
+                QueueUrl: process.env.SQS_QUEUE_URL,
+                MessageBody: JSON.stringify(queueMessage),
+                MessageAttributes: messageAttributes
+              };
+
+              await sqs.sendMessage(sendMessageParams).promise();
+
+              console.log('Message successfully sent to SQS:', {
+                messageId: requestBody.messageId,
+                messageId: sendMessageParams.MessageAttributes.messageId.StringValue
+              });
+
+              // Return success response with queuing confirmation
+              console.log('Request validation, deduplication, storage, and queuing successful:', {
+                messageId: requestBody.messageId,
+                senderId: requestBody.senderId,
+                method: requestBody.method,
                 duplicateDetected: false,
                 stored: true,
-                storedMessage: {
-                  messageId: messageMetadata.messageId,
-                  senderId: messageMetadata.senderId,
-                  status: messageMetadata.status,
-                  attempts: messageMetadata.attempts,
-                  ttl: messageMetadata.ttl,
-                  createdAt: messageMetadata.createdAt
-                }
-              })
-            };
+                queued: true
+              });
+
+              return {
+                statusCode: 200,
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                  'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                },
+                body: JSON.stringify({
+                  message: 'Request validation successful',
+                  requestId: event.requestContext?.requestId || 'unknown',
+                  timestamp: new Date().toISOString(),
+                  duplicateDetected: false,
+                  stored: true,
+                  queued: true,
+                  messageId: requestBody.messageId,
+                  storedMessage: {
+                    messageId: messageMetadata.messageId,
+                    senderId: messageMetadata.senderId,
+                    status: messageMetadata.status,
+                    attempts: messageMetadata.attempts,
+                    ttl: messageMetadata.ttl,
+                    createdAt: messageMetadata.createdAt
+                  }
+                })
+              };
+
+            } catch (error) {
+              // SQS send operation failed - return error
+              console.error('SQS send operation failed:', {
+                error: error.message,
+                messageId: requestBody.messageId,
+                senderId: requestBody.senderId,
+                queueUrl: process.env.SQS_QUEUE_URL
+              });
+
+              return createErrorResponse('SYSTEM_ERROR', 'An internal server error occurred');
+            }
 
           } catch (error) {
             // Storage operation failed - return error
@@ -505,6 +582,7 @@ export class InfrastructureStack extends cdk.Stack {
     this.function.addEnvironment('SERVICE_NAME', 'notification-api');
     this.function.addEnvironment('DYNAMODB_TABLE_NAME', this.table.tableName);
     this.function.addEnvironment('MESSAGE_RETENTION_DAYS', '30');
+    this.function.addEnvironment('SQS_QUEUE_URL', this.queue.queueUrl);
 
     // Configure API Gateway access logging
     const accessLogGroup = new logs.LogGroup(this, 'ApiGatewayAccessLogs', {
