@@ -17,6 +17,9 @@ export class InfrastructureStack extends cdk.Stack {
   public readonly queue: sqs.Queue;
   public readonly queueUrl: string;
   public readonly queueArn: string;
+  public readonly dlq: sqs.Queue;
+  public readonly dlqUrl: string;
+  public readonly dlqArn: string;
   public readonly function: lambda.Function;
   public readonly functionName: string;
   public readonly functionArn: string;
@@ -56,6 +59,19 @@ export class InfrastructureStack extends cdk.Stack {
 
     console.log('SQS queue created:', this.queue.queueName);
 
+    // Create Dead Letter Queue for messages that exhaust all retries
+    this.dlq = new sqs.Queue(this, 'DeadLetterQueue', {
+      visibilityTimeout: cdk.Duration.seconds(30), // Same visibility timeout as main queue
+      retentionPeriod: cdk.Duration.days(14), // Extended retention for dead letters (14 days)
+      deliveryDelay: cdk.Duration.seconds(0), // No delivery delay for DLQ
+      receiveMessageWaitTime: cdk.Duration.seconds(0), // No long polling for DLQ (typically polled manually)
+      maxMessageSizeBytes: 262144, // Same message size as main queue
+      encryption: sqs.QueueEncryption.SQS_MANAGED, // Server-side encryption for security
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // For development
+    });
+
+    console.log('Dead Letter Queue created:', this.dlq.queueName);
+
     // Add CloudWatch alarm for SQS queue depth
     const queueDepthAlarm = new cloudwatch.Alarm(this, 'QueueDepthAlarm', {
       alarmName: `${this.stackName}-SQS-QueueDepth`,
@@ -64,6 +80,16 @@ export class InfrastructureStack extends cdk.Stack {
       threshold: 1000,
       evaluationPeriods: 2,
       comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+    });
+
+    // Add CloudWatch alarm for DLQ depth
+    const dlqDepthAlarm = new cloudwatch.Alarm(this, 'DLQDepthAlarm', {
+      alarmName: `${this.stackName}-DLQ-QueueDepth`,
+      alarmDescription: 'Dead Letter Queue has messages requiring attention',
+      metric: this.dlq.metricApproximateNumberOfMessagesVisible(),
+      threshold: 1, // Alert even on single dead letter message
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
     });
 
     // Create Lambda function for API handler
@@ -570,6 +596,36 @@ export class InfrastructureStack extends cdk.Stack {
         // Worker Lambda handler for SQS message processing
         const axios = require('axios');
 
+        // Calculate exponential backoff delay with jitter for retry attempts
+        function calculateRetryDelay(attemptNumber, baseDelaySeconds = 1, maxDelaySeconds = 60) {
+          // Exponential backoff: baseDelay * (2 ^ attemptNumber)
+          const exponentialDelay = baseDelaySeconds * Math.pow(2, attemptNumber);
+
+          // Add jitter (±25% randomization) to prevent thundering herd
+          const jitterRange = exponentialDelay * 0.25;
+          const jitter = (Math.random() - 0.5) * 2 * jitterRange; // Random value between -jitterRange and +jitterRange
+
+          // Apply maximum delay cap
+          const delayWithJitter = exponentialDelay + jitter;
+          const cappedDelay = Math.min(delayWithJitter, maxDelaySeconds);
+
+          // Ensure minimum delay of 1 second (SQS minimum)
+          const finalDelay = Math.max(cappedDelay, 1);
+
+          return {
+            delaySeconds: Math.floor(finalDelay),
+            exponentialDelay: exponentialDelay,
+            jitterApplied: jitter,
+            delayCapped: delayWithJitter > maxDelaySeconds,
+            calculation: {
+              attemptNumber,
+              baseDelaySeconds,
+              maxDelaySeconds,
+              formula: baseDelaySeconds + ' * (2 ^ ' + attemptNumber + ') + jitter'
+            }
+          };
+        }
+
         // Enhanced HTTP response processing and outcome determination
         function determineDeliveryOutcome(httpResponse, responseTime, correlationId) {
           const statusCode = httpResponse.status;
@@ -954,20 +1010,307 @@ export class InfrastructureStack extends cdk.Stack {
                         errorDetails: outcome.errorDetails
                       });
 
-                      results.push({
-                        messageId: record.messageId,
-                        status: 'failed',
-                        correlationId,
-                        error: outcome.category,
-                        httpStatus: httpResponse.status,
-                        httpStatusText: httpResponse.statusText,
-                        responseTime: requestDuration,
-                        retryEligible: outcome.retryEligible,
-                        finalStatus: 'FAILED',
-                        attempts: deliveryUpdateResult.Attributes.attempts,
-                        outcome: outcome,
-                        deliveryResult: deliveryResult
-                      });
+                      // Update retry information if delivery failed but is retry eligible
+                      if (outcome.retryEligible) {
+                        try {
+                          console.log('Updating retry information for eligible retry:', {
+                            messageId: messageBody.messageId,
+                            correlationId,
+                            currentAttempts: deliveryUpdateResult.Attributes.attempts,
+                            maxRetries: 3
+                          });
+
+                          // Check if we've exceeded maximum retry attempts
+                          const currentAttempts = deliveryUpdateResult.Attributes.attempts || 0;
+                          if (currentAttempts >= 3) {
+                            console.log('Maximum retry attempts exceeded, marking as permanently failed:', {
+                              messageId: messageBody.messageId,
+                              correlationId,
+                              attempts: currentAttempts,
+                              maxRetries: 3,
+                              action: 'mark_as_permanently_failed'
+                            });
+
+                            // Update status to indicate max retries exceeded
+                            const maxRetryUpdateParams = {
+                              TableName: process.env.DYNAMODB_TABLE_NAME || 'NotificationMessages',
+                              Key: {
+                                pk: messageBody.messageId + '#' + messageBody.senderId,
+                                sk: messageBody.timestamp + '#' + messageBody.targetUrl
+                              },
+                              UpdateExpression: 'SET #status = :maxRetryStatus, maxRetriesExceeded = :maxRetryExceeded, maxRetriesExceededAt = :maxRetryExceededAt, lastUpdatedAt = :lastUpdatedAt',
+                              ConditionExpression: 'attribute_exists(pk) AND #status = :currentStatus',
+                              ExpressionAttributeNames: {
+                                '#status': 'status'
+                              },
+                              ExpressionAttributeValues: {
+                                ':maxRetryStatus': 'MAX_RETRIES_EXCEEDED',
+                                ':maxRetryExceeded': true,
+                                ':maxRetryExceededAt': new Date().toISOString(),
+                                ':lastUpdatedAt': new Date().toISOString(),
+                                ':currentStatus': 'FAILED'
+                              },
+                              ReturnValues: 'ALL_NEW'
+                            };
+
+                            await dynamodb.update(maxRetryUpdateParams).promise();
+
+                            console.log('Message marked as permanently failed due to max retries exceeded:', {
+                              messageId: messageBody.messageId,
+                              correlationId,
+                              finalStatus: 'MAX_RETRIES_EXCEEDED',
+                              totalAttempts: currentAttempts
+                            });
+
+                            results.push({
+                              messageId: record.messageId,
+                              status: 'max_retries_exceeded',
+                              correlationId,
+                              error: 'MAX_RETRIES_EXCEEDED',
+                              httpStatus: httpResponse.status,
+                              httpStatusText: httpResponse.statusText,
+                              responseTime: requestDuration,
+                              retryEligible: false, // No longer eligible
+                              finalStatus: 'MAX_RETRIES_EXCEEDED',
+                              attempts: currentAttempts,
+                              maxRetriesExceeded: true,
+                              outcome: outcome,
+                              deliveryResult: deliveryResult
+                            });
+                          } else {
+                            // Calculate retry delay using exponential backoff with jitter
+                            const retryDelay = calculateRetryDelay(currentAttempts);
+                            const nextRetryTimestamp = new Date(Date.now() + (retryDelay.delaySeconds * 1000)).toISOString();
+
+                            console.log('Scheduling retry with calculated delay:', {
+                              messageId: messageBody.messageId,
+                              correlationId,
+                              attemptNumber: currentAttempts,
+                              retryDelaySeconds: retryDelay.delaySeconds,
+                              nextRetryTimestamp,
+                              exponentialDelay: retryDelay.exponentialDelay,
+                              jitterApplied: retryDelay.jitterApplied,
+                              delayCapped: retryDelay.delayCapped
+                            });
+
+                            // Build retry history entry
+                            const retryEntry = {
+                              attemptNumber: currentAttempts,
+                              timestamp: new Date().toISOString(),
+                              errorCategory: outcome.category,
+                              errorDetails: outcome.errorDetails,
+                              responseTime: outcome.responseTime,
+                              httpStatus: outcome.statusCode,
+                              retryDelaySeconds: retryDelay.delaySeconds,
+                              exponentialDelay: retryDelay.exponentialDelay,
+                              jitterApplied: retryDelay.jitterApplied,
+                              nextRetryTimestamp: nextRetryTimestamp,
+                              correlationId: outcome.correlationId
+                            };
+
+                            // Update message with retry information
+                            const retryUpdateParams = {
+                              TableName: process.env.DYNAMODB_TABLE_NAME || 'NotificationMessages',
+                              Key: {
+                                pk: messageBody.messageId + '#' + messageBody.senderId,
+                                sk: messageBody.timestamp + '#' + messageBody.targetUrl
+                              },
+                              UpdateExpression: 'SET nextRetryAt = :nextRetryAt, retryHistory = list_append(if_not_exists(retryHistory, :emptyList), :retryEntry), lastUpdatedAt = :lastUpdatedAt',
+                              ConditionExpression: 'attribute_exists(pk) AND #status = :currentStatus',
+                              ExpressionAttributeNames: {
+                                '#status': 'status'
+                              },
+                              ExpressionAttributeValues: {
+                                ':nextRetryAt': nextRetryTimestamp,
+                                ':retryEntry': [retryEntry],
+                                ':emptyList': [],
+                                ':lastUpdatedAt': new Date().toISOString(),
+                                ':currentStatus': 'FAILED'
+                              },
+                              ReturnValues: 'ALL_NEW'
+                            };
+
+                            const retryUpdateResult = await dynamodb.update(retryUpdateParams).promise();
+
+                            console.log('Retry information successfully updated:', {
+                              messageId: messageBody.messageId,
+                              correlationId,
+                              nextRetryAt: retryUpdateResult.Attributes.nextRetryAt,
+                              retryHistoryLength: retryUpdateResult.Attributes.retryHistory?.length || 0,
+                              attemptNumber: currentAttempts,
+                              retryDelaySeconds: retryDelay.delaySeconds
+                            });
+
+                            // Re-queue the message with calculated delay for retry
+                            try {
+                              console.log('Re-queuing message for retry with delay:', {
+                                messageId: messageBody.messageId,
+                                correlationId,
+                                retryDelaySeconds: retryDelay.delaySeconds,
+                                nextRetryTimestamp,
+                                queueUrl: process.env.SQS_QUEUE_URL
+                              });
+
+                              const AWS = require('aws-sdk');
+                              const sqs = new AWS.SQS();
+
+                              // Prepare retry message with updated attempt count
+                              const retryMessage = {
+                                messageId: messageBody.messageId,
+                                senderId: messageBody.senderId,
+                                timestamp: messageBody.timestamp,
+                                targetUrl: messageBody.targetUrl,
+                                method: messageBody.method,
+                                headers: messageBody.headers,
+                                body: messageBody.body,
+                                correlationId: messageBody.correlationId,
+                                queuedAt: new Date().toISOString(),
+                                attemptNumber: currentAttempts, // Updated attempt count for retry
+                                lastRetryAt: new Date().toISOString(),
+                                retryReason: outcome.category
+                              };
+
+                              // Prepare message attributes for retry tracking
+                              const retryMessageAttributes = {
+                                messageId: {
+                                  DataType: 'String',
+                                  StringValue: messageBody.messageId
+                                },
+                                senderId: {
+                                  DataType: 'String',
+                                  StringValue: messageBody.senderId
+                                },
+                                correlationId: {
+                                  DataType: 'String',
+                                  StringValue: correlationId
+                                },
+                                attemptNumber: {
+                                  DataType: 'Number',
+                                  StringValue: currentAttempts.toString()
+                                },
+                                retryReason: {
+                                  DataType: 'String',
+                                  StringValue: outcome.category
+                                }
+                              };
+
+                              // Send message back to queue with delay
+                              const retrySendParams = {
+                                QueueUrl: process.env.SQS_QUEUE_URL,
+                                MessageBody: JSON.stringify(retryMessage),
+                                MessageAttributes: retryMessageAttributes,
+                                DelaySeconds: retryDelay.delaySeconds // Apply calculated retry delay
+                              };
+
+                              const retrySendResult = await sqs.sendMessage(retrySendParams).promise();
+
+                              console.log('Message successfully re-queued for retry:', {
+                                messageId: messageBody.messageId,
+                                correlationId,
+                                retryDelaySeconds: retryDelay.delaySeconds,
+                                nextRetryTimestamp,
+                                messageId: retrySendResult.MessageId,
+                                attemptNumber: currentAttempts,
+                                retryReason: outcome.category
+                              });
+
+                              results.push({
+                                messageId: record.messageId,
+                                status: 'retry_scheduled',
+                                correlationId,
+                                error: outcome.category,
+                                httpStatus: httpResponse.status,
+                                httpStatusText: httpResponse.statusText,
+                                responseTime: requestDuration,
+                                retryEligible: true,
+                                finalStatus: 'FAILED',
+                                attempts: currentAttempts,
+                                nextRetryAt: nextRetryTimestamp,
+                                retryDelaySeconds: retryDelay.delaySeconds,
+                                retryHistory: retryUpdateResult.Attributes.retryHistory,
+                                requeuedMessageId: retrySendResult.MessageId,
+                                outcome: outcome,
+                                deliveryResult: deliveryResult
+                              });
+
+                            } catch (requeueError) {
+                              console.error('Failed to re-queue message for retry:', {
+                                messageId: messageBody.messageId,
+                                correlationId,
+                                retryDelaySeconds: retryDelay.delaySeconds,
+                                error: requeueError.message,
+                                errorCode: requeueError.code,
+                                willContinue: true // Continue processing despite re-queue failure
+                              });
+
+                              // Still add result but mark the re-queuing failure
+                              results.push({
+                                messageId: record.messageId,
+                                status: 'retry_scheduled',
+                                correlationId,
+                                error: outcome.category,
+                                httpStatus: httpResponse.status,
+                                httpStatusText: httpResponse.statusText,
+                                responseTime: requestDuration,
+                                retryEligible: true,
+                                finalStatus: 'FAILED',
+                                attempts: currentAttempts,
+                                nextRetryAt: nextRetryTimestamp,
+                                retryDelaySeconds: retryDelay.delaySeconds,
+                                retryHistory: retryUpdateResult.Attributes.retryHistory,
+                                requeueFailed: true,
+                                requeueError: requeueError.message,
+                                outcome: outcome,
+                                deliveryResult: deliveryResult
+                              });
+                            }
+                          }
+
+                        } catch (retryUpdateError) {
+                          console.error('Failed to update retry information:', {
+                            messageId: messageBody.messageId,
+                            correlationId,
+                            error: retryUpdateError.message,
+                            errorCode: retryUpdateError.code,
+                            retryEligible: outcome.retryEligible,
+                            willContinue: true // Continue processing despite retry update failure
+                          });
+
+                          // Still add result but mark the retry update failure
+                          results.push({
+                            messageId: record.messageId,
+                            status: 'failed',
+                            correlationId,
+                            error: outcome.category,
+                            httpStatus: httpResponse.status,
+                            httpStatusText: httpResponse.statusText,
+                            responseTime: requestDuration,
+                            retryEligible: outcome.retryEligible,
+                            retryUpdateFailed: true,
+                            retryUpdateError: retryUpdateError.message,
+                            finalStatus: 'FAILED',
+                            attempts: deliveryUpdateResult.Attributes.attempts,
+                            outcome: outcome,
+                            deliveryResult: deliveryResult
+                          });
+                        }
+                      } else {
+                        // Not retry eligible - add result without retry scheduling
+                        results.push({
+                          messageId: record.messageId,
+                          status: 'failed',
+                          correlationId,
+                          error: outcome.category,
+                          httpStatus: httpResponse.status,
+                          httpStatusText: httpResponse.statusText,
+                          responseTime: requestDuration,
+                          retryEligible: false,
+                          finalStatus: 'FAILED',
+                          attempts: deliveryUpdateResult.Attributes.attempts,
+                          outcome: outcome,
+                          deliveryResult: deliveryResult
+                        });
+                      }
                     }
 
                   } catch (deliveryUpdateError) {
@@ -1319,6 +1662,8 @@ export class InfrastructureStack extends cdk.Stack {
     this.tableArn = this.table.tableArn;
     this.queueUrl = this.queue.queueUrl;
     this.queueArn = this.queue.queueArn;
+    this.dlqUrl = this.dlq.queueUrl;
+    this.dlqArn = this.dlq.queueArn;
 
     new cdk.CfnOutput(this, 'TableName', {
       value: this.table.tableName,
@@ -1506,6 +1851,18 @@ export class InfrastructureStack extends cdk.Stack {
       value: `https://${cdk.Aws.REGION}.console.aws.amazon.com/cloudwatch/home?region=${cdk.Aws.REGION}#dashboards:name=${dashboard.dashboardName}`,
       description: 'CloudWatch dashboard URL for monitoring',
       exportName: `${this.stackName}-DashboardUrl`,
+    });
+
+    new cdk.CfnOutput(this, 'DLQUrl', {
+      value: this.dlq.queueUrl,
+      description: 'Dead Letter Queue URL for failed messages',
+      exportName: `${this.stackName}-DLQUrl`,
+    });
+
+    new cdk.CfnOutput(this, 'DLQArn', {
+      value: this.dlq.queueArn,
+      description: 'Dead Letter Queue ARN for redrive policy configuration',
+      exportName: `${this.stackName}-DLQArn`,
     });
 
     new cdk.CfnOutput(this, 'ApiKeyId', {
