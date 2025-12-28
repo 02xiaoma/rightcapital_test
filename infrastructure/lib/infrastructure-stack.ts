@@ -570,6 +570,94 @@ export class InfrastructureStack extends cdk.Stack {
         // Worker Lambda handler for SQS message processing
         const axios = require('axios');
 
+        // Enhanced HTTP response processing and outcome determination
+        function determineDeliveryOutcome(httpResponse, responseTime, correlationId) {
+          const statusCode = httpResponse.status;
+
+          // Extract error details from response body if available
+          let errorDetails = null;
+          try {
+            if (httpResponse.data && typeof httpResponse.data === 'object') {
+              // Attempt to extract structured error information
+              errorDetails = {
+                message: httpResponse.data.message || httpResponse.data.error,
+                code: httpResponse.data.code || httpResponse.data.errorCode,
+                details: httpResponse.data.details || httpResponse.data.errors
+              };
+            } else if (httpResponse.data && typeof httpResponse.data === 'string') {
+              // Handle plain text error responses
+              errorDetails = { message: httpResponse.data.substring(0, 500) };
+            }
+          } catch (parseError) {
+            // Gracefully handle malformed response bodies
+            console.warn('Failed to parse response body for error details:', {
+              correlationId,
+              parseError: parseError.message
+            });
+          }
+
+          // Determine outcome based on HTTP status code
+          let outcome;
+
+          // 2xx - Success (no retry needed)
+          if (statusCode >= 200 && statusCode < 300) {
+            outcome = {
+              success: true,
+              retryEligible: false,
+              category: 'SUCCESS',
+              statusCode,
+              statusText: httpResponse.statusText,
+              responseTime,
+              timestamp: new Date().toISOString(),
+              correlationId
+            };
+          }
+          // 4xx - Client Error (no retry - permanent failure)
+          else if (statusCode >= 400 && statusCode < 500) {
+            outcome = {
+              success: false,
+              retryEligible: false,
+              category: 'CLIENT_ERROR',
+              statusCode,
+              statusText: httpResponse.statusText,
+              responseTime,
+              errorDetails,
+              timestamp: new Date().toISOString(),
+              correlationId
+            };
+          }
+          // 5xx - Server Error (retry eligible)
+          else if (statusCode >= 500 && statusCode < 600) {
+            outcome = {
+              success: false,
+              retryEligible: true,
+              category: 'SERVER_ERROR',
+              statusCode,
+              statusText: httpResponse.statusText,
+              responseTime,
+              errorDetails,
+              timestamp: new Date().toISOString(),
+              correlationId
+            };
+          }
+          // Other status codes (1xx, 3xx, etc.)
+          else {
+            outcome = {
+              success: false,
+              retryEligible: false, // Conservative approach - don't retry unknown codes
+              category: 'UNKNOWN_STATUS',
+              statusCode,
+              statusText: httpResponse.statusText,
+              responseTime,
+              errorDetails,
+              timestamp: new Date().toISOString(),
+              correlationId
+            };
+          }
+
+          return outcome;
+        }
+
         exports.handler = async (event) => {
           console.log('Worker processing SQS messages:', {
             messageCount: event.Records?.length || 0,
@@ -752,15 +840,28 @@ export class InfrastructureStack extends cdk.Stack {
                     hasResponseHeaders: !!httpResponse.headers
                   });
 
-                  // Determine success based on HTTP status code (2xx range)
-                  const isSuccess = httpResponse.status >= 200 && httpResponse.status < 300;
+                  // Enhanced outcome determination with status code interpretation
+                  const outcome = determineDeliveryOutcome(httpResponse, requestDuration, correlationId);
 
-                  if (isSuccess) {
+                  console.log('Delivery outcome determined:', {
+                    messageId: messageBody.messageId,
+                    correlationId,
+                    outcome: {
+                      success: outcome.success,
+                      retryEligible: outcome.retryEligible,
+                      category: outcome.category,
+                      statusCode: outcome.statusCode,
+                      responseTime: outcome.responseTime
+                    }
+                  });
+
+                  if (outcome.success) {
                     console.log('Message delivery successful:', {
                       messageId: messageBody.messageId,
                       correlationId,
                       httpStatus: httpResponse.status,
-                      responseTime: requestDuration
+                      responseTime: requestDuration,
+                      category: outcome.category
                     });
 
                     results.push({
@@ -771,25 +872,31 @@ export class InfrastructureStack extends cdk.Stack {
                       httpStatus: httpResponse.status,
                       httpStatusText: httpResponse.statusText,
                       responseTime: requestDuration,
-                      deliveredAt: new Date().toISOString()
+                      deliveredAt: new Date().toISOString(),
+                      outcome: outcome // Include structured outcome data
                     });
                   } else {
-                    console.error('HTTP request returned error status:', {
+                    console.error('Message delivery failed:', {
                       messageId: messageBody.messageId,
                       correlationId,
                       httpStatus: httpResponse.status,
                       httpStatusText: httpResponse.statusText,
-                      responseTime: requestDuration
+                      responseTime: requestDuration,
+                      category: outcome.category,
+                      retryEligible: outcome.retryEligible,
+                      errorDetails: outcome.errorDetails
                     });
 
                     results.push({
                       messageId: record.messageId,
                       status: 'failed',
                       correlationId,
-                      error: 'HTTP_ERROR_STATUS',
+                      error: outcome.category,
                       httpStatus: httpResponse.status,
                       httpStatusText: httpResponse.statusText,
-                      responseTime: requestDuration
+                      responseTime: requestDuration,
+                      retryEligible: outcome.retryEligible,
+                      outcome: outcome // Include structured outcome data
                     });
                   }
 
