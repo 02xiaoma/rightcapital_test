@@ -6,6 +6,7 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
+import * as iam from 'aws-cdk-lib/aws-iam';
 
 export class InfrastructureStack extends cdk.Stack {
   public readonly table: dynamodb.TableV2;
@@ -119,6 +120,38 @@ export class InfrastructureStack extends cdk.Stack {
     });
 
     console.log('Lambda function created:', this.function.functionName);
+
+    // Add IAM policies for DynamoDB and SQS access
+    // DynamoDB policy
+    const dynamoDBPolicy = new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'dynamodb:GetItem',
+        'dynamodb:PutItem',
+        'dynamodb:UpdateItem',
+        'dynamodb:Query',
+        'dynamodb:Scan',
+        'dynamodb:UpdateTimeToLive',
+      ],
+      resources: [this.table.tableArn],
+    });
+
+    // SQS policy
+    const sqsPolicy = new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'sqs:SendMessage',
+        'sqs:ReceiveMessage',
+        'sqs:DeleteMessage',
+        'sqs:GetQueueAttributes',
+        'sqs:GetQueueUrl',
+      ],
+      resources: [this.queue.queueArn],
+    });
+
+    // Attach policies to Lambda execution role
+    this.function.addToRolePolicy(dynamoDBPolicy);
+    this.function.addToRolePolicy(sqsPolicy);
 
     // Create API Gateway REST API
     this.api = new apigateway.RestApi(this, 'NotificationApi', {
